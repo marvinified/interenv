@@ -582,7 +582,7 @@ cmd_list() {
 }
 
 cmd_install() {
-  url="${INTER_ENV_INSTALL_URL:-https://raw.githubusercontent.com/bytode/inter-env/main/install.sh}"
+  url="${INTER_ENV_INSTALL_URL:-https://raw.githubusercontent.com/marvinified/interenv/main/install.sh}"
   curl -fsSL "$url" | sh
 }
 

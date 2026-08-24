@@ -25,6 +25,24 @@ const SERVER_TOKEN = process.env.INTER_ENV_SERVER_TOKEN || "";
 
 const app = express();
 
+app.get("/", (_req, res) => {
+  res.type("text/plain").send(
+    [
+      "inter-env",
+      "",
+      "Encrypted .env sync across machines.",
+      "",
+      "CLI: interenv init",
+      "Health: /health",
+      "API: /v1",
+      "",
+      "GitHub: https://github.com/marvinified/interenv",
+      "Bytode: https://bytode.dev",
+      "",
+    ].join("\n"),
+  );
+});
+
 app.use(express.raw({ type: "*/*", limit: MAX_BYTES }));
 app.use((req, res, next) => {
   cleanPairFiles();

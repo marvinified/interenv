@@ -4,7 +4,7 @@ set -eu
 
 PREFIX="${PREFIX:-/usr/local/bin}"
 TARGET="$PREFIX/interenv"
-RAW="${INTER_ENV_CLIENT_URL:-https://raw.githubusercontent.com/bytode/inter-env/main/bin/interenv}"
+RAW="${INTER_ENV_CLIENT_URL:-https://raw.githubusercontent.com/marvinified/interenv/main/bin/interenv}"
 
 mkdir -p "$PREFIX"
 

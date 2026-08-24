@@ -2,22 +2,22 @@
 
 `inter-env` syncs `.env` and `.env.*` files across machines for the same Git project.
 
-Each user has one inter-env account key. Env files are encrypted on the device before upload, and the backend stores only encrypted files.
+The CLI command is `interenv`. By default it uses the hosted free service at `https://interenv.bytode.dev`, so most users only install the CLI and run `interenv init` inside a repo.
 
-By default, the CLI uses the hosted free inter-env service. Users only need to self-host if they want their own infrastructure.
+Each user has one inter-env account key. Env files are encrypted on the device before upload, and the backend stores only encrypted files.
 
 ## Install
 
 Install the client from GitHub:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bytode/inter-env/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/marvinified/interenv/main/install.sh | sh
 ```
 
 If `/usr/local/bin` needs permissions:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bytode/inter-env/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/marvinified/interenv/main/install.sh | sudo sh
 ```
 
 ## Requirements
@@ -30,19 +30,86 @@ Client machines need:
 - `openssl`
 - `tar`
 
-macOS and most Linux machines already have these, except Git may need to be installed separately. Windows users should run `inter-env` through Git Bash or WSL, not `cmd.exe` or PowerShell directly.
+macOS and most Linux machines already have these, except Git may need to be installed separately. Windows users should run `interenv` through Git Bash or WSL, not `cmd.exe` or PowerShell directly.
 
 Self-hosting the backend needs Node.js. The server is TypeScript and uses Express.
 
-## Hosted Service
+## Quick Start
 
-Normal setup uses the hosted service baked into the CLI: `https://interenv.bytode.dev`.
+### New Account
+
+Inside a Git repo:
 
 ```sh
 interenv init
 ```
 
-To point the CLI at a private/self-hosted backend, pass a URL with a token:
+Choose:
+
+```text
+1) Set up fresh account
+```
+
+The command creates an account id, private account key, device id, local config at `~/.inter-env/config`, a project id from the repo's Git `origin`, and a background watcher.
+
+It also prints a recovery key. Keep it private. Anyone with that key can decrypt your synced env files.
+
+### Pair Another Device
+
+On an already linked device:
+
+```sh
+interenv pair
+```
+
+That prints a one-time pairing code.
+
+On the new device, inside the same Git project:
+
+```sh
+interenv init
+```
+
+Choose:
+
+```text
+2) Link this device with a pairing code
+```
+
+Paste the pairing code. The new device downloads an encrypted key bundle, decrypts it locally using the pairing code, saves the account key, then pulls the project env files.
+
+The server never receives the account key in plaintext. Pairing codes are one-time and expire after 15 minutes by default.
+
+## How It Works
+
+`inter-env` groups projects by normalized Git `origin` URL. These are treated as the same project:
+
+```text
+git@github.com:owner/app.git
+https://github.com/owner/app.git
+```
+
+It syncs only root-level env files:
+
+```text
+.env
+.env.*
+```
+
+Examples:
+
+```text
+.env
+.env.local
+.env.production
+.env.development
+```
+
+When a watched env file changes, the client packages the env files with `tar`, encrypts the package with the local account key using `openssl`, and uploads the encrypted blob to the backend.
+
+Other linked machines periodically pull the encrypted blob, decrypt it locally, and apply the env files to the matching Git project.
+
+To point the CLI at a private or self-hosted backend, pass a URL with a token:
 
 ```sh
 INTER_ENV_SERVER_URL="https://private.example.com/my-token" interenv init
@@ -92,90 +159,6 @@ data/
 ```
 
 `env.bin` is encrypted before it reaches the server. Pairing files are encrypted key bundles and are deleted after they are used.
-
-## First Device
-
-Inside a Git repo:
-
-```sh
-interenv init
-```
-
-Choose:
-
-```text
-1) Set up fresh account
-```
-
-The command creates:
-
-- an account id
-- a private account key
-- a device id
-- local config at `~/.inter-env/config`
-- a project id from the repo's Git `origin`
-- a background watcher
-
-It also prints a recovery key. Keep it private. Anyone with that key can decrypt your synced env files.
-
-## Link Another Device
-
-On an already linked device:
-
-```sh
-interenv pair
-```
-
-That prints a one-time pairing code.
-
-On the new device, inside the same Git project:
-
-```sh
-interenv init
-```
-
-Choose:
-
-```text
-2) Link this device with a pairing code
-```
-
-Paste the pairing code. The new device downloads an encrypted key bundle, decrypts it locally using the pairing code, saves the account key, then pulls the project env files.
-
-The server never receives the account key in plaintext. Pairing codes are one-time and expire after 15 minutes by default.
-
-## How Sync Works
-
-`inter-env` groups projects by normalized Git `origin` URL. These are treated as the same project:
-
-```text
-git@github.com:owner/app.git
-https://github.com/owner/app.git
-```
-
-It syncs only root-level env files:
-
-```text
-.env
-.env.*
-```
-
-Examples:
-
-```text
-.env
-.env.local
-.env.production
-.env.development
-```
-
-When a watched env file changes, the client:
-
-1. packages the env files with `tar`
-2. encrypts the package with the local account key using `openssl`
-3. uploads the encrypted blob to the backend
-
-Other linked machines periodically pull the encrypted blob, decrypt it locally, and apply the env files to the matching Git project.
 
 ## Server Cleanup
 

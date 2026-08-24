@@ -50,6 +50,11 @@ curl -fsS -H "x-inter-env-token: testtoken" "http://127.0.0.1:$PORT/health" >/de
   fail "server did not start"
 }
 
+root_body=$(curl -fsS "http://127.0.0.1:$PORT/")
+printf '%s\n' "$root_body" | grep -q 'inter-env' || fail "root route missing service name"
+printf '%s\n' "$root_body" | grep -q 'https://github.com/marvinified/interenv' || fail "root route missing repo link"
+printf '%s\n' "$root_body" | grep -q 'https://bytode.dev' || fail "root route missing blog link"
+
 git init -q "$TMP/device-a-repo"
 git init -q "$TMP/device-b-repo"
 git -C "$TMP/device-a-repo" remote add origin git@github.com:example/app.git
