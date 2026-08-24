@@ -22,18 +22,21 @@ macOS and most Linux machines already have these, except Git may need to be inst
 
 Self-hosting the backend needs Node.js. The server is TypeScript and uses Express.
 
+---
+
 ## Quick Start
 
-### First Machine
+
+
+### Connect First Machine
 
 ```sh
 interenv setup    # choose "Set up fresh account"
-interenv init     # run inside each repo to sync
 ```
 
-Keep the recovery key printed during setup private.
 
-### Additonal Machines
+
+### Connect Additonal Machines
 
 ```sh
 # On an existing machine
@@ -41,6 +44,15 @@ interenv pair # returns a 6-character pairing code
 
 # On the new machine
 interenv setup    # choose "Link this device" and enter the pairing code
+```
+
+
+
+### Sync a project
+
+To enable env syncing in a project, run the following (needs to be a git repo with a remote url)
+
+```sh
 interenv init     # run inside each repo to sync
 ```
 
@@ -62,7 +74,11 @@ curl -fsSL https://interenv.bytode.dev/share.sh?TOKEN | sh -s -- /path/to/folder
 
 The encrypted share is deleted after its first download and expires after 15 minutes if unused.
 
-Share tokens use 12 uppercase, ambiguity-free characters and a deliberately expensive key-derivation step.
+
+
+---
+
+
 
 ## How It Works
 
@@ -256,6 +272,8 @@ interenv upgrade                             Upgrade the CLI
 interenv uninstall                           Remove the CLI only
 interenv version                             Print the version
 ```
+
+
 
 ## Security Model
 
