@@ -2,7 +2,7 @@
 
 set -eu
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
 INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
 CONFIG="$INTER_ENV_HOME/config"
@@ -24,6 +24,7 @@ Usage:
   interenv setup --link --server URL[/token] --code C
   interenv init [repo]                         Register and sync a Git repo
   interenv pair                                Create a one-time pairing code from this device
+  interenv share [folder]                      Create a one-time env share command
   interenv project delete [repo]               Delete a synced project from the account
   interenv account delete                      Permanently delete this account and local state
   interenv sync [repo]                         Pull then push changed env files
@@ -843,6 +844,29 @@ cmd_project_delete() {
   printf 'Deleted project %s from the account. Local env files were kept.\n' "$project"
 }
 
+cmd_share() {
+  ensure_deps
+  ensure_home
+  load_config
+  [ "$#" -le 1 ] || die "usage: interenv share [folder]"
+  folder_arg=${1:-.}
+  folder=$(CDPATH= cd -- "$folder_arg" 2>/dev/null && pwd) || die "folder does not exist: $folder_arg"
+  has_env_files "$folder" || die "no .env files found in $folder"
+
+  token=$(random_hex 32)
+  tarfile="$INTER_ENV_HOME/share.tar.$$"
+  enc="$INTER_ENV_HOME/share.enc.$$"
+  package_env "$folder" "$tarfile" || die "could not package env files"
+  encrypt_file "$tarfile" "$enc" "$token"
+  if ! http_put "/v1/share/$token" "$enc"; then
+    rm -f "$tarfile" "$enc"
+    die "could not upload one-time share"
+  fi
+  rm -f "$tarfile" "$enc"
+  base=$(printf '%s' "$SERVER_URL" | sed 's#/$##')
+  printf 'curl -fsSL %s/share.sh?%s | sh\n' "$base" "$token"
+}
+
 sync_all() {
   all_repos | while IFS= read -r repo; do
     [ -d "$repo/.git" ] || continue
@@ -976,6 +1000,7 @@ case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   init) shift; cmd_init "$@" ;;
   pair) shift; cmd_pair ;;
+  share) shift; cmd_share "$@" ;;
   project)
     shift
     case "${1:-}" in

@@ -46,6 +46,22 @@ interenv init     # run inside each repo to sync
 
 
 
+### Share Once
+
+Create a one-time encrypted share for every env file under the current folder:
+
+```sh
+interenv share .
+```
+
+Run the returned command from the destination folder. To choose a destination explicitly:
+
+```sh
+curl -fsSL https://interenv.bytode.dev/share.sh?TOKEN | sh -s -- /path/to/folder
+```
+
+The encrypted share is deleted after its first download and expires after 15 minutes if unused.
+
 ## How It Works
 
 `inter-env` groups projects by normalized Git `origin` URL. These are treated as the same project:
@@ -129,6 +145,7 @@ PORT=4010 \
 INTER_ENV_SERVER_DATA=/var/lib/inter-env \
 INTER_ENV_SERVER_TOKEN=my-token \
 INTER_ENV_MAX_PROJECTS=100 \
+INTER_ENV_PUBLIC_URL=https://private.example.com \
 yarn start
 ```
 
@@ -144,9 +161,10 @@ data/
   accounts/<account-id>/projects/<project-id>/env.rev
   accounts/<account-id>/projects/<project-id>/devices/<device-id>.rev
   pairs/<pair-id>.bin
+  shares/<share-token>.bin
 ```
 
-`env.bin` is encrypted before it reaches the server. Pairing files are encrypted key bundles and are deleted after they are used.
+`env.bin` is encrypted before it reaches the server. Pairing files are encrypted key bundles. Share files are encrypted with their one-time token. Pairing and share files are deleted after use or expiry.
 
 ## Project Limits
 
@@ -200,6 +218,7 @@ interenv setup --fresh --server URL[/token]  Create an account non-interactively
 interenv setup --link --server URL[/token] --code CODE
 interenv init [repo]                         Register and sync a Git repo
 interenv pair                                Create a one-time pairing code
+interenv share [folder]                      Create a one-time env share command
 interenv project delete [repo]               Delete a synced project
 interenv account delete                      Delete the account and local state
 interenv sync [repo]                         Pull then push changed env files

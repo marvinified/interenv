@@ -22,7 +22,9 @@ const DATA_DIR = process.env.INTER_ENV_SERVER_DATA || join(process.cwd(), "data"
 const MAX_BYTES = Number(process.env.INTER_ENV_MAX_BYTES || 10 * 1024 * 1024);
 const MAX_PROJECTS = Number(process.env.INTER_ENV_MAX_PROJECTS || 100);
 const PAIR_TTL_MS = Number(process.env.INTER_ENV_PAIR_TTL_MS || 15 * 60 * 1000);
+const SHARE_TTL_MS = Number(process.env.INTER_ENV_SHARE_TTL_MS || 15 * 60 * 1000);
 const SERVER_TOKEN = process.env.INTER_ENV_SERVER_TOKEN || "";
+const PUBLIC_URL = (process.env.INTER_ENV_PUBLIC_URL || "").replace(/\/$/, "");
 
 const app = express();
 
@@ -35,6 +37,7 @@ app.get("/", (_req, res) => {
       "",
       "Setup: interenv setup",
       "Sync a repo: interenv init",
+      "Share once: interenv share .",
       "Install: curl -fsSL https://interenv.bytode.dev/install.sh | sh",
       "Health: /health",
       "API: /v1",
@@ -52,6 +55,33 @@ app.get("/install.sh", (_req, res) => {
 
 app.get("/interenv", (_req, res) => {
   res.type("text/x-shellscript").sendFile(join(__dirname, "interenv"));
+});
+
+app.get("/share.sh", (req, res) => {
+  const token = shareTokenFromQuery(req);
+  if (!token) {
+    res.status(400).type("text/plain").send("invalid share token\n");
+    return;
+  }
+
+  const baseUrl = PUBLIC_URL || requestBaseUrl(req);
+  res.type("text/x-shellscript").send(shareInstallScript(baseUrl, token));
+});
+
+app.get("/v1/share/:shareId", (req, res) => {
+  const { shareId } = req.params;
+  if (!validShareId(res, shareId)) return;
+  cleanShareFiles();
+
+  const file = shareFile(shareId);
+  if (!existsSync(file)) {
+    res.status(404).type("text/plain").send("share not found, expired, or already used\n");
+    return;
+  }
+
+  const body = readFileSync(file);
+  rmSync(file, { force: true });
+  res.type("application/octet-stream").send(body);
 });
 
 app.use(express.raw({ type: "*/*", limit: MAX_BYTES }));
@@ -281,6 +311,17 @@ app.put("/v1/pair/:pairId", (req, res) => {
   res.status(204).send();
 });
 
+app.put("/v1/share/:shareId", (req, res) => {
+  const { shareId } = req.params;
+  if (!validShareId(res, shareId)) return;
+
+  if (!writeShareFileOnce(shareId, requestBody(req))) {
+    res.status(409).type("text/plain").send("share token already active\n");
+    return;
+  }
+  res.status(204).send();
+});
+
 app.get("/v1/pair/:pairId", (req, res) => {
   const { pairId } = req.params;
   if (!validPairCode(res, pairId)) return;
@@ -324,6 +365,13 @@ function validPairCode(res: Response, code: string): boolean {
   return false;
 }
 
+function validShareId(res: Response, shareId: string): boolean {
+  if (/^[a-f0-9]{64}$/.test(shareId)) return true;
+
+  res.status(400).type("text/plain").send("invalid share token\n");
+  return false;
+}
+
 function requestBody(req: Request): Buffer {
   return Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 }
@@ -337,6 +385,18 @@ function writeFileAtomic(file: string, body: Buffer): void {
 
 function writePairFileOnce(pairId: string, body: Buffer): boolean {
   const file = pairFile(pairId);
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(file, body, { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+function writeShareFileOnce(shareId: string, body: Buffer): boolean {
+  const file = shareFile(shareId);
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   try {
     writeFileSync(file, body, { flag: "wx", mode: 0o600 });
@@ -389,6 +449,10 @@ function deviceFile(account: string, project: string, device: string): string {
 
 function pairFile(pairId: string): string {
   return join(DATA_DIR, "pairs", `${pairId}.bin`);
+}
+
+function shareFile(shareId: string): string {
+  return join(DATA_DIR, "shares", `${shareId}.bin`);
 }
 
 function sha256(buffer: Buffer): string {
@@ -478,6 +542,62 @@ function cleanPairFiles(): void {
       // Ignore files concurrently consumed by another request.
     }
   }
+}
+
+function cleanShareFiles(): void {
+  const dir = join(DATA_DIR, "shares");
+  if (!existsSync(dir)) return;
+
+  const now = Date.now();
+  for (const file of readdirSync(dir)) {
+    const full = join(dir, file);
+    try {
+      const stat = statSync(full);
+      if (now - stat.mtimeMs > SHARE_TTL_MS) rmSync(full, { force: true });
+    } catch {
+      // Ignore files concurrently consumed by another request.
+    }
+  }
+}
+
+function shareTokenFromQuery(req: Request): string | null {
+  const query = req.originalUrl.split("?", 2)[1] || "";
+  const raw = decodeURIComponent(query.split("&", 1)[0] || "").replace(/^token=/, "");
+  return /^[a-f0-9]{64}$/.test(raw) ? raw : null;
+}
+
+function requestBaseUrl(req: Request): string {
+  const forwarded = req.header("x-forwarded-proto")?.split(",", 1)[0].trim();
+  const protocol = forwarded === "https" ? "https" : "http";
+  const host = req.header("host") || "localhost";
+  if (!/^[A-Za-z0-9.:[\]-]+$/.test(host)) throw new Error("invalid request host");
+  return `${protocol}://${host}`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function shareInstallScript(baseUrl: string, token: string): string {
+  const url = shellQuote(`${baseUrl}/v1/share/${token}`);
+  const secret = shellQuote(token);
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    'target=${1:-.}',
+    'for command_name in curl openssl tar; do command -v "$command_name" >/dev/null 2>&1 || { printf \'Missing required command: %s\\n\' "$command_name" >&2; exit 1; }; done',
+    'mkdir -p "$target"',
+    '[ -w "$target" ] || { printf \'Destination is not writable: %s\\n\' "$target" >&2; exit 1; }',
+    'tmp_dir="${TMPDIR:-/tmp}/interenv-share.$$"',
+    'umask 077',
+    'mkdir "$tmp_dir"',
+    'trap \'rm -rf "$tmp_dir"\' EXIT INT TERM',
+    `curl -fsSL ${url} -o "$tmp_dir/env.enc"`,
+    `INTER_ENV_SECRET=${secret} openssl enc -d -aes-256-cbc -pbkdf2 -in "$tmp_dir/env.enc" -out "$tmp_dir/env.tar" -pass env:INTER_ENV_SECRET`,
+    'tar -xf "$tmp_dir/env.tar" -C "$target"',
+    'printf \'Installed shared env files into %s\\n\' "$target"',
+    "",
+  ].join("\n");
 }
 
 function cleanupSyncedProject(account: string, project: string): void {

@@ -91,6 +91,19 @@ assert_file_contains "$TMP/device-b-repo/.env.local" "ONE=1"
 assert_file_contains "$TMP/device-b-repo/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/device-b-repo/packages/web/.env.local" "WEB_ONE=1"
 
+share_command=$(INTER_ENV_HOME="$TMP/device-a-home" interenv share "$TMP/device-a-repo")
+share_url=$(printf '%s\n' "$share_command" | awk '/^curl -fsSL / {print $3}')
+printf '%s\n' "$share_url" | grep -Eq "^http://127.0.0.1:$PORT/share.sh\?[a-f0-9]{64}$" || fail "share did not return a valid one-time command"
+mkdir -p "$TMP/share-target"
+curl -fsSL "$share_url" | sh -s -- "$TMP/share-target" >/dev/null
+assert_file_contains "$TMP/share-target/.env.local" "ONE=1"
+assert_file_contains "$TMP/share-target/apps/api/.env" "API_ONE=1"
+assert_file_contains "$TMP/share-target/packages/web/.env.local" "WEB_ONE=1"
+mkdir -p "$TMP/share-second-target"
+if curl -fsSL "$share_url" 2>/dev/null | sh -s -- "$TMP/share-second-target" >/dev/null 2>&1; then
+  fail "one-time share could be downloaded twice"
+fi
+
 if find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
   fail "server kept env blob after both devices acknowledged the first revision"
 fi
