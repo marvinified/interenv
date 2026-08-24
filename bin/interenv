@@ -1,0 +1,613 @@
+#!/bin/sh
+
+set -eu
+
+VERSION="0.2.0"
+DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
+INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
+CONFIG="$INTER_ENV_HOME/config"
+REGISTRY="$INTER_ENV_HOME/repos.tsv"
+STATE_DIR="$INTER_ENV_HOME/state"
+LOCK_DIR="$INTER_ENV_HOME/lock"
+LOG_FILE="$INTER_ENV_HOME/inter-env.log"
+PID_FILE="$INTER_ENV_HOME/inter-env.pid"
+INTERVAL="${INTER_ENV_INTERVAL:-10}"
+
+usage() {
+  cat <<'EOF'
+inter-env - encrypted .env sync across machines
+
+Usage:
+  interenv init [repo]                         Set up account/link device, register repo, sync
+  interenv init --fresh --server URL[/token]   Non-interactive fresh setup
+  interenv init --link --server URL[/token] --code C
+  interenv pair                                Create a one-time pairing code from this device
+  interenv sync [repo]                         Pull then push changed env files
+  interenv pull [repo]                         Pull encrypted env files from the server
+  interenv push [repo]                         Encrypt and upload local env files
+  interenv watch                               Run the foreground watcher loop
+  interenv start                               Start the background watcher
+  interenv stop                                Stop the background watcher
+  interenv status                              Show account, watcher, and repo status
+  interenv list                                List registered repos
+  interenv install                             Install from GitHub
+  interenv version                             Print version
+
+Environment:
+  INTER_ENV_HOME                               State directory, default ~/.inter-env
+  INTER_ENV_SERVER_URL                         Override server URL, optionally URL/token
+  INTER_ENV_DEFAULT_SERVER_URL                 Hosted service URL baked into the client
+  INTER_ENV_INTERVAL                           Watch poll interval in seconds, default 10
+EOF
+}
+
+die() {
+  printf 'inter-env: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  mkdir -p "$INTER_ENV_HOME"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+ensure_deps() {
+  need git
+  need curl
+  need openssl
+  need tar
+  need cksum
+  need awk
+  need sed
+}
+
+ensure_home() {
+  mkdir -p "$INTER_ENV_HOME" "$STATE_DIR"
+  chmod 700 "$INTER_ENV_HOME" 2>/dev/null || true
+  [ -f "$REGISTRY" ] || : >"$REGISTRY"
+}
+
+load_config() {
+  [ -f "$CONFIG" ] || die "no account configured; run interenv init"
+  # shellcheck disable=SC1090
+  . "$CONFIG"
+  [ "${SERVER_URL:-}" ] || die "config missing SERVER_URL"
+  [ "${ACCOUNT_ID:-}" ] || die "config missing ACCOUNT_ID"
+  [ "${ACCOUNT_KEY:-}" ] || die "config missing ACCOUNT_KEY"
+  if [ -z "${DEVICE_ID:-}" ]; then
+    DEVICE_ID=$(random_hex 8)
+    save_config "$SERVER_URL" "$ACCOUNT_ID" "$ACCOUNT_KEY" "$DEVICE_ID" "${SERVER_TOKEN:-}"
+  fi
+}
+
+save_config() {
+  server=$1
+  account_id=$2
+  account_key=$3
+  device_id=${4:-$(random_hex 8)}
+  server_token=${5:-}
+  ensure_home
+  {
+    printf 'SERVER_URL=%s\n' "$(quote_value "$server")"
+    [ -z "$server_token" ] || printf 'SERVER_TOKEN=%s\n' "$(quote_value "$server_token")"
+    printf 'ACCOUNT_ID=%s\n' "$(quote_value "$account_id")"
+    printf 'ACCOUNT_KEY=%s\n' "$(quote_value "$account_key")"
+    printf 'DEVICE_ID=%s\n' "$(quote_value "$device_id")"
+  } >"$CONFIG"
+  chmod 600 "$CONFIG"
+}
+
+quote_value() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+random_hex() {
+  openssl rand -hex "$1"
+}
+
+random_b64() {
+  openssl rand -base64 "$1" | tr -d '\n'
+}
+
+sha256() {
+  printf '%s' "$1" | openssl dgst -sha256 -r | awk '{print $1}'
+}
+
+file_sha256() {
+  openssl dgst -sha256 -r "$1" | awk '{print $1}'
+}
+
+repo_root() {
+  repo=${1:-.}
+  git -C "$repo" rev-parse --show-toplevel 2>/dev/null || return 1
+}
+
+remote_url() {
+  repo=$1
+  url=$(git -C "$repo" config --get remote.origin.url 2>/dev/null || true)
+  [ -n "$url" ] || url=$(git -C "$repo" remote get-url origin 2>/dev/null || true)
+  [ -n "$url" ] || return 1
+  normalize_remote "$url"
+}
+
+normalize_remote() {
+  url=$1
+  case "$url" in
+    git@*:*) url=$(printf '%s\n' "$url" | sed 's#^git@\([^:]*\):#https://\1/#') ;;
+    ssh://git@*) url=$(printf '%s\n' "$url" | sed 's#^ssh://git@#https://#') ;;
+  esac
+  printf '%s\n' "$url" | sed 's#^http://#https://#; s#/$##; s#\.git$##'
+}
+
+project_id() {
+  sha256 "$1" | cut -c 1-32
+}
+
+registered_remote() {
+  repo=$1
+  awk -F '\t' -v path="$repo" '$3 == path {print $1; found=1} END {exit found ? 0 : 1}' "$REGISTRY"
+}
+
+registered_project() {
+  repo=$1
+  awk -F '\t' -v path="$repo" '$3 == path {print $2; found=1} END {exit found ? 0 : 1}' "$REGISTRY"
+}
+
+register_repo() {
+  repo=$1
+  remote=$2
+  project=$3
+  ensure_home
+  tmp="$REGISTRY.tmp.$$"
+  awk -F '\t' -v path="$repo" '$3 != path' "$REGISTRY" >"$tmp"
+  printf '%s\t%s\t%s\n' "$remote" "$project" "$repo" >>"$tmp"
+  mv "$tmp" "$REGISTRY"
+}
+
+all_repos() {
+  awk -F '\t' 'NF >= 3 {print $3}' "$REGISTRY"
+}
+
+repo_state_file() {
+  project=$1
+  repo=$2
+  rid=$(sha256 "$repo" | cut -c 1-16)
+  mkdir -p "$STATE_DIR/$project"
+  printf '%s/%s/%s.sig\n' "$STATE_DIR" "$project" "$rid"
+}
+
+env_files() {
+  repo=$1
+  for file in "$repo"/.env "$repo"/.env.*; do
+    [ -f "$file" ] || continue
+    base=${file##*/}
+    case "$base" in
+      .inter-env* | .env.*.tmp) continue ;;
+    esac
+    printf '%s\n' "$base"
+  done
+}
+
+env_signature() {
+  repo=$1
+  env_files "$repo" | sort | while IFS= read -r name; do
+    sum=$(cksum <"$repo/$name" | awk '{print $1 ":" $2}')
+    printf '%s\t%s\n' "$name" "$sum"
+  done
+}
+
+has_env_files() {
+  repo=$1
+  [ -n "$(env_files "$repo" | sed -n '1p')" ]
+}
+
+encrypt_file() {
+  input=$1
+  output=$2
+  pass=$3
+  INTER_ENV_SECRET=$pass openssl enc -aes-256-cbc -pbkdf2 -salt -in "$input" -out "$output" -pass env:INTER_ENV_SECRET
+}
+
+decrypt_file() {
+  input=$1
+  output=$2
+  pass=$3
+  INTER_ENV_SECRET=$pass openssl enc -d -aes-256-cbc -pbkdf2 -in "$input" -out "$output" -pass env:INTER_ENV_SECRET
+}
+
+api_url() {
+  path=$1
+  base=$(printf '%s' "$SERVER_URL" | sed 's#/$##')
+  printf '%s%s\n' "$base" "$path"
+}
+
+http_put() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")" >/dev/null
+  else
+    curl -fsS -X PUT --data-binary "@$file" "$(api_url "$path")" >/dev/null
+  fi
+}
+
+http_put_capture() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
+  else
+    curl -fsS -X PUT --data-binary "@$file" "$(api_url "$path")"
+  fi
+}
+
+http_get() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -fs -H "x-inter-env-token: $SERVER_TOKEN" -o "$file" "$(api_url "$path")"
+  else
+    curl -fs -o "$file" "$(api_url "$path")"
+  fi
+}
+
+parse_server_spec() {
+  spec=$1
+  parsed_server=$(printf '%s' "$spec" | sed 's#/$##')
+  parsed_token=""
+  case "$parsed_server" in
+    http://*/* | https://*/*)
+      parsed_token=${parsed_server##*/}
+      parsed_server=${parsed_server%/*}
+      ;;
+  esac
+}
+
+ack_revision() {
+  project=$1
+  revision=$2
+  ack="$INTER_ENV_HOME/ack.$$"
+  printf '%s\n' "$revision" >"$ack"
+  http_put "/v1/accounts/$ACCOUNT_ID/projects/$project/devices/$DEVICE_ID" "$ack"
+  rm -f "$ack"
+}
+
+setup_fresh() {
+  parse_server_spec "$1"
+  account_key=$(random_b64 32)
+  account_id=$(sha256 "$account_key" | cut -c 1-24)
+  device_id=$(random_hex 8)
+  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token"
+  printf 'Fresh inter-env account created.\n'
+  printf 'Account id: %s\n' "$account_id"
+  printf 'Recovery key: %s\n' "$account_key"
+  printf 'Keep the recovery key somewhere private. It can decrypt your synced env files.\n'
+}
+
+setup_link() {
+  parse_server_spec "$1"
+  code=$2
+  pair_id=$(printf '%s' "$code" | sed 's/-.*$//')
+  pair_secret=$(printf '%s' "$code" | sed 's/^[^-]*-//')
+  [ "$pair_id" != "$pair_secret" ] || die "pairing code must look like id-secret"
+  ensure_home
+  enc="$INTER_ENV_HOME/pair.enc.$$"
+  plain="$INTER_ENV_HOME/pair.plain.$$"
+  SERVER_URL=$parsed_server
+  SERVER_TOKEN=$parsed_token
+  export SERVER_URL
+  export SERVER_TOKEN
+  if ! http_get "/v1/pair/$pair_id" "$enc"; then
+    rm -f "$enc" "$plain"
+    die "pairing code not found or expired"
+  fi
+  if ! decrypt_file "$enc" "$plain" "$pair_secret" 2>/dev/null; then
+    rm -f "$enc" "$plain"
+    die "could not decrypt pairing bundle; check the code"
+  fi
+  account_id=$(sed -n '1p' "$plain")
+  account_key=$(sed -n '2p' "$plain")
+  rm -f "$enc" "$plain"
+  [ -n "$account_id" ] && [ -n "$account_key" ] || die "invalid pairing bundle"
+  device_id=$(random_hex 8)
+  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token"
+  printf 'Device linked to account %s\n' "$account_id"
+}
+
+interactive_account_setup() {
+  server=${INTER_ENV_SERVER_URL:-$DEFAULT_SERVER_URL}
+  [ -n "$server" ] || die "server URL is required"
+  printf 'Choose setup mode:\n'
+  printf '  1) Set up fresh account\n'
+  printf '  2) Link this device with a pairing code\n'
+  printf 'Selection [1/2]: '
+  IFS= read -r choice
+  case "$choice" in
+    1|'') setup_fresh "$server" ;;
+    2)
+      printf 'Pairing code: '
+      IFS= read -r code
+      setup_link "$server" "$code"
+      ;;
+    *) die "invalid selection" ;;
+  esac
+}
+
+cmd_pair() {
+  ensure_deps
+  ensure_home
+  load_config
+  pair_id=$(random_hex 4)
+  pair_secret=$(random_hex 16)
+  code="$pair_id-$pair_secret"
+  plain="$INTER_ENV_HOME/pair.plain.$$"
+  enc="$INTER_ENV_HOME/pair.enc.$$"
+  {
+    printf '%s\n' "$ACCOUNT_ID"
+    printf '%s\n' "$ACCOUNT_KEY"
+  } >"$plain"
+  chmod 600 "$plain"
+  encrypt_file "$plain" "$enc" "$pair_secret"
+  http_put "/v1/pair/$pair_id" "$enc"
+  rm -f "$plain" "$enc"
+  printf 'Pairing code: %s\n' "$code"
+  printf 'Use it on the new device with: interenv init\n'
+  printf 'The code is one-time and expires on the server.\n'
+}
+
+package_env() {
+  repo=$1
+  out=$2
+  list="$INTER_ENV_HOME/envfiles.$$"
+  env_files "$repo" | sort >"$list"
+  [ -s "$list" ] || {
+    rm -f "$list"
+    return 1
+  }
+  # .env file names are controlled by inter-env; spaces are intentionally unsupported.
+  tar -cf "$out" -C "$repo" $(cat "$list")
+  rm -f "$list"
+}
+
+cmd_pull_repo() {
+  repo=$(repo_root "${1:-.}") || die "not inside a Git repo"
+  load_config
+  remote=$(registered_remote "$repo" || true)
+  [ -n "$remote" ] || remote=$(remote_url "$repo") || die "repo has no origin remote"
+  project=$(registered_project "$repo" || true)
+  [ -n "$project" ] || project=$(project_id "$remote")
+  register_repo "$repo" "$remote" "$project"
+  enc="$INTER_ENV_HOME/pull.enc.$$"
+  tarfile="$INTER_ENV_HOME/pull.tar.$$"
+  if http_get "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc"; then
+    revision=$(file_sha256 "$enc")
+    decrypt_file "$enc" "$tarfile" "$ACCOUNT_KEY" || {
+      rm -f "$enc" "$tarfile"
+      die "server data could not be decrypted with this account key"
+    }
+    tar -xf "$tarfile" -C "$repo"
+    env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
+    ack_revision "$project" "$revision"
+    rm -f "$enc" "$tarfile"
+    printf 'Pulled env files for %s\n' "$repo"
+  else
+    rm -f "$enc" "$tarfile"
+    printf 'No remote env files found for this project yet.\n'
+  fi
+}
+
+cmd_push_repo() {
+  repo=$(repo_root "${1:-.}") || die "not inside a Git repo"
+  load_config
+  remote=$(registered_remote "$repo" || true)
+  [ -n "$remote" ] || remote=$(remote_url "$repo") || die "repo has no origin remote"
+  project=$(registered_project "$repo" || true)
+  [ -n "$project" ] || project=$(project_id "$remote")
+  register_repo "$repo" "$remote" "$project"
+  has_env_files "$repo" || {
+    printf 'No .env files to push for %s\n' "$repo"
+    return 0
+  }
+  tarfile="$INTER_ENV_HOME/push.tar.$$"
+  enc="$INTER_ENV_HOME/push.enc.$$"
+  package_env "$repo" "$tarfile" || return 0
+  encrypt_file "$tarfile" "$enc" "$ACCOUNT_KEY"
+  revision=$(http_put_capture "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc" | sed -n '1p')
+  [ -n "$revision" ] || revision=$(file_sha256 "$enc")
+  env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
+  ack_revision "$project" "$revision"
+  rm -f "$tarfile" "$enc"
+  printf 'Pushed encrypted env files for %s\n' "$repo"
+}
+
+cmd_sync_repo() {
+  repo=$(repo_root "${1:-.}") || die "not inside a Git repo"
+  load_config
+  remote=$(registered_remote "$repo" || true)
+  [ -n "$remote" ] || remote=$(remote_url "$repo") || die "repo has no origin remote"
+  project=$(registered_project "$repo" || true)
+  [ -n "$project" ] || project=$(project_id "$remote")
+  register_repo "$repo" "$remote" "$project"
+  state=$(repo_state_file "$project" "$repo")
+  before="$INTER_ENV_HOME/before.$$"
+  env_signature "$repo" >"$before"
+  changed=1
+  [ -f "$state" ] && cmp -s "$before" "$state" && changed=0
+  rm -f "$before"
+  if [ "$changed" -eq 1 ] && has_env_files "$repo"; then
+    cmd_push_repo "$repo" >/dev/null
+    log "synced local changes for $repo"
+  else
+    cmd_pull_repo "$repo" >/dev/null || true
+  fi
+}
+
+with_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+    "$@"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    trap - EXIT INT TERM
+  else
+    die "another inter-env process is running"
+  fi
+}
+
+install_hooks() {
+  repo=$1
+  hooks="$repo/.git/hooks"
+  mkdir -p "$hooks"
+  for hook in post-checkout post-merge post-commit; do
+    path="$hooks/$hook"
+    if [ ! -f "$path" ]; then
+      {
+        printf '#!/bin/sh\n'
+        printf 'command -v interenv >/dev/null 2>&1 && interenv sync "%s" >/dev/null 2>&1 || true\n' "$repo"
+      } >"$path"
+      chmod +x "$path"
+    elif ! grep -q 'interenv sync' "$path"; then
+      {
+        printf '\n# inter-env\n'
+        printf 'command -v interenv >/dev/null 2>&1 && interenv sync "%s" >/dev/null 2>&1 || true\n' "$repo"
+      } >>"$path"
+    fi
+  done
+}
+
+cmd_init() {
+  ensure_deps
+  mode=""
+  server="${INTER_ENV_SERVER_URL:-$DEFAULT_SERVER_URL}"
+  code=""
+  repo_arg="."
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --fresh) mode=fresh ;;
+      --link) mode=link ;;
+      --server) shift; server=${1:-} ;;
+      --code) shift; code=${1:-} ;;
+      *) repo_arg=$1 ;;
+    esac
+    shift || true
+  done
+  if [ ! -f "$CONFIG" ]; then
+    case "$mode" in
+      fresh) [ -n "$server" ] || die "--server is required"; setup_fresh "$server" ;;
+      link) [ -n "$server" ] || die "--server is required"; [ -n "$code" ] || die "--code is required"; setup_link "$server" "$code" ;;
+      *) interactive_account_setup ;;
+    esac
+  fi
+  repo=$(repo_root "$repo_arg") || die "not inside a Git repo"
+  remote=$(remote_url "$repo") || die "repo has no origin remote"
+  project=$(project_id "$remote")
+  register_repo "$repo" "$remote" "$project"
+  cmd_sync_repo "$repo"
+  install_hooks "$repo"
+  if [ "${INTER_ENV_NO_START:-0}" != "1" ]; then
+    cmd_start >/dev/null 2>&1 || true
+  fi
+  printf 'Registered %s\n' "$repo"
+  printf 'Project id: %s\n' "$project"
+}
+
+sync_all() {
+  all_repos | while IFS= read -r repo; do
+    [ -d "$repo/.git" ] || continue
+    cmd_sync_repo "$repo" || log "sync failed for $repo"
+  done
+}
+
+cmd_watch() {
+  ensure_deps
+  ensure_home
+  load_config
+  log "watcher started"
+  while :; do
+    sync_all
+    sleep "$INTERVAL"
+  done
+}
+
+cmd_start() {
+  ensure_home
+  if [ -f "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'interenv watcher already running: %s\n' "$pid"
+      return 0
+    fi
+  fi
+  nohup "$0" watch >>"$LOG_FILE" 2>&1 &
+  printf '%s\n' "$!" >"$PID_FILE"
+  printf 'interenv watcher started: %s\n' "$!"
+}
+
+cmd_stop() {
+  [ -f "$PID_FILE" ] || die "watcher is not running"
+  pid=$(cat "$PID_FILE")
+  if kill "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    printf 'interenv watcher stopped\n'
+  else
+    rm -f "$PID_FILE"
+    die "stale pid file removed"
+  fi
+}
+
+cmd_status() {
+  ensure_home
+  if [ -f "$CONFIG" ]; then
+    load_config
+    printf 'Account: %s\n' "$ACCOUNT_ID"
+    printf 'Server: %s\n' "$SERVER_URL"
+  else
+    printf 'Account: not configured\n'
+  fi
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    printf 'Watcher: running (%s)\n' "$(cat "$PID_FILE")"
+  else
+    printf 'Watcher: stopped\n'
+  fi
+  count=$(awk 'END {print NR + 0}' "$REGISTRY")
+  printf 'Registered repos: %s\n' "$count"
+}
+
+cmd_list() {
+  ensure_home
+  awk -F '\t' '{printf "%s  %s  %s\n", $2, $1, $3}' "$REGISTRY"
+}
+
+cmd_install() {
+  url="${INTER_ENV_INSTALL_URL:-https://raw.githubusercontent.com/bytode/inter-env/main/install.sh}"
+  curl -fsSL "$url" | sh
+}
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  pair) shift; cmd_pair ;;
+  sync)
+    shift
+    ensure_deps
+    ensure_home
+    if [ "${1:-}" ]; then
+      with_lock cmd_sync_repo "$1"
+    else
+      with_lock sync_all
+    fi
+    ;;
+  pull) shift; ensure_deps; ensure_home; cmd_pull_repo "${1:-.}" ;;
+  push) shift; ensure_deps; ensure_home; cmd_push_repo "${1:-.}" ;;
+  watch) shift; cmd_watch ;;
+  start) shift; cmd_start ;;
+  stop) shift; cmd_stop ;;
+  status) shift; cmd_status ;;
+  list) shift; cmd_list ;;
+  install) shift; cmd_install ;;
+  version|--version|-v) printf '%s\n' "$VERSION" ;;
+  help|--help|-h|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac

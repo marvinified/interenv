@@ -1,0 +1,24 @@
+{
+  "name": "@inter-env/server",
+  "version": "0.2.0",
+  "private": true,
+  "description": "File-backed inter-env API server",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "yarn build && node --env-file-if-exists=.env --watch dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
