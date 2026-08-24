@@ -31,7 +31,8 @@ yarn build
 ```
 
 The test starts a local server and covers setup, pairing, one-time sharing,
-nested env files, sync metadata, cleanup, project limits, deletion, and uninstall behavior.
+nested env files, `.envignore`, sync metadata, cleanup, project limits, deletion,
+and uninstall behavior.
 
 For CLI changes, also verify shell syntax:
 

@@ -366,7 +366,7 @@ function validPairCode(res: Response, code: string): boolean {
 }
 
 function validShareId(res: Response, shareId: string): boolean {
-  if (/^[a-f0-9]{64}$/.test(shareId)) return true;
+  if (/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}$/.test(shareId)) return true;
 
   res.status(400).type("text/plain").send("invalid share token\n");
   return false;
@@ -563,7 +563,7 @@ function cleanShareFiles(): void {
 function shareTokenFromQuery(req: Request): string | null {
   const query = req.originalUrl.split("?", 2)[1] || "";
   const raw = decodeURIComponent(query.split("&", 1)[0] || "").replace(/^token=/, "");
-  return /^[a-f0-9]{64}$/.test(raw) ? raw : null;
+  return /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}$/.test(raw) ? raw : null;
 }
 
 function requestBaseUrl(req: Request): string {
@@ -593,7 +593,7 @@ function shareInstallScript(baseUrl: string, token: string): string {
     'mkdir "$tmp_dir"',
     'trap \'rm -rf "$tmp_dir"\' EXIT INT TERM',
     `curl -fsSL ${url} -o "$tmp_dir/env.enc"`,
-    `INTER_ENV_SECRET=${secret} openssl enc -d -aes-256-cbc -pbkdf2 -in "$tmp_dir/env.enc" -out "$tmp_dir/env.tar" -pass env:INTER_ENV_SECRET`,
+    `INTER_ENV_SECRET=${secret} openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$tmp_dir/env.enc" -out "$tmp_dir/env.tar" -pass env:INTER_ENV_SECRET`,
     'tar -xf "$tmp_dir/env.tar" -C "$target"',
     'printf \'Installed shared env files into %s\\n\' "$target"',
     "",

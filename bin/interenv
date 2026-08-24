@@ -136,6 +136,16 @@ random_pair_code() {
   done
 }
 
+random_share_token() {
+  while :; do
+    token=$(openssl rand -base64 64 | tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' | cut -c 1-12)
+    [ "${#token}" -eq 12 ] && {
+      printf '%s\n' "$token"
+      return
+    }
+  done
+}
+
 sha256() {
   printf '%s' "$1" | openssl dgst -sha256 -r | awk '{print $1}'
 }
@@ -212,9 +222,9 @@ repo_state_file() {
 }
 
 env_files() {
-  repo=$1
+  ef_repo=$1
   (
-    cd "$repo" || exit 1
+    cd "$ef_repo" || exit 1
     find . \
       \( -path './.git' \
       -o -path './node_modules' \
@@ -233,7 +243,97 @@ env_files() {
       if (base ~ /^\.env\..*\.tmp$/) next
       print
     }
-  '
+  ' | while IFS= read -r name; do
+    ignored_env_file "$ef_repo" "$name" || printf '%s\n' "$name"
+  done
+}
+
+ignored_env_file() {
+  ief_repo=$1
+  ief_name=$2
+  ief_rules="$ief_repo/.envignore"
+  [ -f "$ief_rules" ] || return 1
+  while IFS= read -r ief_line || [ -n "$ief_line" ]; do
+    ief_line=$(printf '%s' "$ief_line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$ief_line" in
+      ''|'#'*) continue ;;
+      file[[:space:]]*)
+        ief_pattern=$(printf '%s' "${ief_line#file}" | sed 's/^[[:space:]]*//')
+        case "$ief_name" in $ief_pattern) return 0 ;; esac
+        ;;
+    esac
+  done <"$ief_rules"
+  return 1
+}
+
+ignored_env_variable() {
+  iev_repo=$1
+  iev_name=$2
+  iev_key=$3
+  iev_rules="$iev_repo/.envignore"
+  [ -f "$iev_rules" ] || return 1
+  while IFS= read -r iev_line || [ -n "$iev_line" ]; do
+    iev_line=$(printf '%s' "$iev_line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$iev_line" in
+      ''|'#'*) continue ;;
+    esac
+    iev_field_count=$(printf '%s\n' "$iev_line" | awk '{print NF}')
+    iev_directive=$(printf '%s\n' "$iev_line" | awk '{print $1}')
+    iev_first=$(printf '%s\n' "$iev_line" | awk '{print $2}')
+    iev_second=$(printf '%s\n' "$iev_line" | awk '{print $3}')
+    [ "$iev_directive" = "variable" ] || continue
+    if [ "$iev_field_count" -eq 2 ]; then
+      iev_path_pattern='*'
+      iev_key_pattern=$iev_first
+    elif [ "$iev_field_count" -eq 3 ]; then
+      iev_path_pattern=$iev_first
+      iev_key_pattern=$iev_second
+    else
+      continue
+    fi
+    case "$iev_name" in $iev_path_pattern)
+      case "$iev_key" in $iev_key_pattern) return 0 ;; esac
+      ;;
+    esac
+  done <"$iev_rules"
+  return 1
+}
+
+env_line_key() {
+  elk_line=$1
+  elk_key=$(printf '%s\n' "$elk_line" | sed -n 's/^[[:space:]]*export[[:space:]][[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\1/p')
+  [ -n "$elk_key" ] || elk_key=$(printf '%s\n' "$elk_line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\1/p')
+  printf '%s\n' "$elk_key"
+}
+
+filter_env_file() {
+  fef_repo=$1
+  fef_name=$2
+  fef_input=$3
+  fef_output=$4
+  : >"$fef_output"
+  while IFS= read -r fef_line || [ -n "$fef_line" ]; do
+    fef_key=$(env_line_key "$fef_line")
+    if [ -n "$fef_key" ] && ignored_env_variable "$fef_repo" "$fef_name" "$fef_key"; then
+      continue
+    fi
+    printf '%s\n' "$fef_line" >>"$fef_output"
+  done <"$fef_input"
+}
+
+collect_ignored_variables() {
+  civ_repo=$1
+  civ_name=$2
+  civ_input=$3
+  civ_output=$4
+  : >"$civ_output"
+  [ -f "$civ_input" ] || return 0
+  while IFS= read -r civ_line || [ -n "$civ_line" ]; do
+    civ_key=$(env_line_key "$civ_line")
+    if [ -n "$civ_key" ] && ignored_env_variable "$civ_repo" "$civ_name" "$civ_key"; then
+      printf '%s\n' "$civ_line" >>"$civ_output"
+    fi
+  done <"$civ_input"
 }
 
 env_signature() {
@@ -252,7 +352,10 @@ env_content_hash() {
   repo=$1
   manifest="$INTER_ENV_HOME/hash-manifest.$$"
   env_files "$repo" | sort | while IFS= read -r name; do
-    printf '%s\t%s\n' "$name" "$(canonical_file_hash "$repo/$name")"
+    filtered="$INTER_ENV_HOME/hash-file.$$"
+    filter_env_file "$repo" "$name" "$repo/$name" "$filtered"
+    printf '%s\t%s\n' "$name" "$(canonical_file_hash "$filtered")"
+    rm -f "$filtered"
   done >"$manifest"
   manifest_hash=$(openssl dgst -sha256 -r "$manifest" | awk '{print $1}')
   rm -f "$manifest"
@@ -613,13 +716,43 @@ package_env() {
   repo=$1
   out=$2
   list="$INTER_ENV_HOME/envfiles.$$"
+  stage="$INTER_ENV_HOME/package.$$"
   env_files "$repo" | sort >"$list"
   [ -s "$list" ] || {
     rm -f "$list"
     return 1
   }
+  mkdir -p "$stage"
+  while IFS= read -r name; do
+    mkdir -p "$stage/$(dirname "$name")"
+    filter_env_file "$repo" "$name" "$repo/$name" "$stage/$name"
+  done <"$list"
   # .env file names are controlled by inter-env; spaces are intentionally unsupported.
-  tar -cf "$out" -C "$repo" $(cat "$list")
+  tar -cf "$out" -C "$stage" $(cat "$list")
+  rm -rf "$stage"
+  rm -f "$list"
+}
+
+apply_env_archive() {
+  repo=$1
+  tarfile=$2
+  stage="$INTER_ENV_HOME/extract.$$"
+  list="$INTER_ENV_HOME/extract-files.$$"
+  mkdir -p "$stage"
+  tar -xf "$tarfile" -C "$stage"
+  env_files "$stage" | sort >"$list"
+  while IFS= read -r name; do
+    ignored_env_file "$repo" "$name" && continue
+    filtered="$INTER_ENV_HOME/received.$$"
+    preserved="$INTER_ENV_HOME/preserved.$$"
+    filter_env_file "$repo" "$name" "$stage/$name" "$filtered"
+    collect_ignored_variables "$repo" "$name" "$repo/$name" "$preserved"
+    [ ! -s "$preserved" ] || cat "$preserved" >>"$filtered"
+    mkdir -p "$repo/$(dirname "$name")"
+    mv "$filtered" "$repo/$name"
+    rm -f "$preserved"
+  done <"$list"
+  rm -rf "$stage"
   rm -f "$list"
 }
 
@@ -655,7 +788,7 @@ cmd_pull_repo() {
     rm -f "$enc" "$tarfile"
     die "server data could not be decrypted with this account key"
   }
-  tar -xf "$tarfile" -C "$repo"
+  apply_env_archive "$repo" "$tarfile"
   env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
   ack_revision "$project" "$revision"
   rm -f "$enc" "$tarfile"
@@ -853,11 +986,11 @@ cmd_share() {
   folder=$(CDPATH= cd -- "$folder_arg" 2>/dev/null && pwd) || die "folder does not exist: $folder_arg"
   has_env_files "$folder" || die "no .env files found in $folder"
 
-  token=$(random_hex 32)
+  token=$(random_share_token)
   tarfile="$INTER_ENV_HOME/share.tar.$$"
   enc="$INTER_ENV_HOME/share.enc.$$"
   package_env "$folder" "$tarfile" || die "could not package env files"
-  encrypt_file "$tarfile" "$enc" "$token"
+  encrypt_pair_file "$tarfile" "$enc" "$token"
   if ! http_put "/v1/share/$token" "$enc"; then
     rm -f "$tarfile" "$enc"
     die "could not upload one-time share"

@@ -62,6 +62,8 @@ curl -fsSL https://interenv.bytode.dev/share.sh?TOKEN | sh -s -- /path/to/folder
 
 The encrypted share is deleted after its first download and expires after 15 minutes if unused.
 
+Share tokens use 12 uppercase, ambiguity-free characters and a deliberately expensive key-derivation step.
+
 ## How It Works
 
 `inter-env` groups projects by normalized Git `origin` URL. These are treated as the same project:
@@ -90,6 +92,27 @@ packages/web/.env.local
 ```
 
 It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`.
+
+### Ignoring Env Data
+
+Add `.envignore` to a project root to exclude files or variables from sync, hashes, and one-time shares:
+
+```text
+# Complete files, using shell-style path patterns
+file .env.personal
+file apps/legacy/.env.*
+file */.env.local
+
+# Variables in every env file
+variable LOCAL_ONLY
+variable DEBUG_SECRET
+
+# Variables in one file or matching path
+variable apps/api/.env DATABASE_URL
+variable apps/*/.env INTERNAL_TOKEN
+```
+
+Pulling keeps ignored files and preserves existing ignored local variables while updating the remaining variables. Variable rules recognize `KEY=value` and `export KEY=value` assignments. Commit `.envignore` when every machine should use the same policy.
 
 Every five seconds, the client compares a small remote metadata record with an account-keyed hash of local env paths and contents. Matching hashes require no env download. Blank lines, trailing newlines, and `CRLF` versus `LF` do not change the hash, but changing an env value or file path does.
 

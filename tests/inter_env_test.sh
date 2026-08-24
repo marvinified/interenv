@@ -30,6 +30,14 @@ assert_file_contains() {
   [ "$actual" = "$expected" ] || fail "expected $file to contain '$expected', got '$actual'"
 }
 
+assert_file_lacks() {
+  file=$1
+  unexpected=$2
+  [ -f "$file" ] || fail "missing file $file"
+  grep -q "$unexpected" "$file" && fail "expected $file not to contain '$unexpected'"
+  return 0
+}
+
 mkdir -p "$TMP"
 SERVER_ENTRY="$ROOT/dist/index.js"
 [ -f "$SERVER_ENTRY" ] || fail "missing compiled server; run yarn build"
@@ -68,10 +76,18 @@ git init -q "$TMP/device-b-repo"
 git -C "$TMP/device-a-repo" remote add origin git@github.com:example/app.git
 git -C "$TMP/device-b-repo" remote add origin https://github.com/example/app.git
 
-mkdir -p "$TMP/device-a-repo/apps/api" "$TMP/device-a-repo/packages/web"
-printf 'ONE=1\n' >"$TMP/device-a-repo/.env.local"
-printf 'API_ONE=1\n' >"$TMP/device-a-repo/apps/api/.env"
+mkdir -p "$TMP/device-a-repo/apps/api" "$TMP/device-a-repo/apps/ignored" "$TMP/device-a-repo/packages/web"
+printf 'ONE=1\nLOCAL_ONLY=device-a\n' >"$TMP/device-a-repo/.env.local"
+printf 'API_ONE=1\nAPI_LOCAL=device-a\n' >"$TMP/device-a-repo/apps/api/.env"
 printf 'WEB_ONE=1\n' >"$TMP/device-a-repo/packages/web/.env.local"
+printf 'PRIVATE=1\n' >"$TMP/device-a-repo/.env.private"
+printf 'IGNORED=1\n' >"$TMP/device-a-repo/apps/ignored/.env"
+printf '%s\n' \
+  'file .env.private' \
+  'file apps/ignored/.env*' \
+  'variable LOCAL_ONLY' \
+  'variable apps/*/.env API_LOCAL' >"$TMP/device-a-repo/.envignore"
+cp "$TMP/device-a-repo/.envignore" "$TMP/device-b-repo/.envignore"
 
 INTER_ENV_HOME="$TMP/device-a-home" interenv setup --fresh --server "$SERVER_URL" >/dev/null
 INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-a-repo" >/dev/null
@@ -90,15 +106,22 @@ INTER_ENV_HOME="$TMP/device-b-home" INTER_ENV_NO_START=1 interenv init "$TMP/dev
 assert_file_contains "$TMP/device-b-repo/.env.local" "ONE=1"
 assert_file_contains "$TMP/device-b-repo/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/device-b-repo/packages/web/.env.local" "WEB_ONE=1"
+assert_file_lacks "$TMP/device-b-repo/.env.local" "LOCAL_ONLY"
+assert_file_lacks "$TMP/device-b-repo/apps/api/.env" "API_LOCAL"
+[ ! -f "$TMP/device-b-repo/.env.private" ] || fail "ignored env file was synced"
+[ ! -f "$TMP/device-b-repo/apps/ignored/.env" ] || fail "ignored nested env file was synced"
 
 share_command=$(INTER_ENV_HOME="$TMP/device-a-home" interenv share "$TMP/device-a-repo")
 share_url=$(printf '%s\n' "$share_command" | awk '/^curl -fsSL / {print $3}')
-printf '%s\n' "$share_url" | grep -Eq "^http://127.0.0.1:$PORT/share.sh\?[a-f0-9]{64}$" || fail "share did not return a valid one-time command"
+printf '%s\n' "$share_url" | grep -Eq "^http://127.0.0.1:$PORT/share.sh\?[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}$" || fail "share did not return a valid one-time command"
 mkdir -p "$TMP/share-target"
 curl -fsSL "$share_url" | sh -s -- "$TMP/share-target" >/dev/null
 assert_file_contains "$TMP/share-target/.env.local" "ONE=1"
 assert_file_contains "$TMP/share-target/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/share-target/packages/web/.env.local" "WEB_ONE=1"
+assert_file_lacks "$TMP/share-target/.env.local" "LOCAL_ONLY"
+assert_file_lacks "$TMP/share-target/apps/api/.env" "API_LOCAL"
+[ ! -f "$TMP/share-target/.env.private" ] || fail "one-time share included an ignored env file"
 mkdir -p "$TMP/share-second-target"
 if curl -fsSL "$share_url" 2>/dev/null | sh -s -- "$TMP/share-second-target" >/dev/null 2>&1; then
   fail "one-time share could be downloaded twice"
@@ -108,8 +131,8 @@ if find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
   fail "server kept env blob after both devices acknowledged the first revision"
 fi
 
-printf 'TWO=2\n' >"$TMP/device-b-repo/.env.local"
-printf 'API_TWO=2\n' >"$TMP/device-b-repo/apps/api/.env"
+printf 'TWO=2\nLOCAL_ONLY=device-b\n' >"$TMP/device-b-repo/.env.local"
+printf 'API_TWO=2\nAPI_LOCAL=device-b\n' >"$TMP/device-b-repo/apps/api/.env"
 mkdir -p "$TMP/device-b-repo/services/worker"
 printf 'WORKER_TWO=2\n' >"$TMP/device-b-repo/services/worker/.env.production"
 INTER_ENV_HOME="$TMP/device-b-home" interenv sync "$TMP/device-b-repo"
@@ -119,9 +142,13 @@ if ! find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
 fi
 
 INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
-assert_file_contains "$TMP/device-a-repo/.env.local" "TWO=2"
-assert_file_contains "$TMP/device-a-repo/apps/api/.env" "API_TWO=2"
+grep -q '^TWO=2$' "$TMP/device-a-repo/.env.local" || fail "pull did not update the root env file"
+grep -q '^API_TWO=2$' "$TMP/device-a-repo/apps/api/.env" || fail "pull did not update the nested env file"
 assert_file_contains "$TMP/device-a-repo/services/worker/.env.production" "WORKER_TWO=2"
+grep -q '^LOCAL_ONLY=device-a$' "$TMP/device-a-repo/.env.local" || fail "pull did not preserve an ignored local variable"
+grep -q '^API_LOCAL=device-a$' "$TMP/device-a-repo/apps/api/.env" || fail "pull did not preserve a file-specific ignored variable"
+assert_file_contains "$TMP/device-a-repo/.env.private" "PRIVATE=1"
+assert_file_contains "$TMP/device-a-repo/apps/ignored/.env" "IGNORED=1"
 
 if find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
   fail "server kept env blob after both devices acknowledged the second revision"
@@ -139,6 +166,11 @@ printf '\n' >>"$TMP/device-a-repo/apps/api/.env"
 INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
 meta_after=$(curl -fsS -H "x-inter-env-token: testtoken" "$meta_url")
 [ "$meta_before" = "$meta_after" ] || fail "blank line changed the canonical env hash"
+printf 'TWO=2\nLOCAL_ONLY=changed-locally\n' >"$TMP/device-a-repo/.env.local"
+printf 'PRIVATE=changed-locally\n' >"$TMP/device-a-repo/.env.private"
+INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
+meta_after_ignore_change=$(curl -fsS -H "x-inter-env-token: testtoken" "$meta_url")
+[ "$meta_before" = "$meta_after_ignore_change" ] || fail "ignored data changed the project hash"
 
 git init -q "$TMP/device-a-new-repo"
 git -C "$TMP/device-a-new-repo" remote add origin https://github.com/example/new-app.git
