@@ -20,6 +20,7 @@ const PORT = Number(process.env.PORT || process.env.INTER_ENV_SERVER_PORT || 401
 const HOST = process.env.HOST || process.env.INTER_ENV_SERVER_HOST || "0.0.0.0";
 const DATA_DIR = process.env.INTER_ENV_SERVER_DATA || join(process.cwd(), "data");
 const MAX_BYTES = Number(process.env.INTER_ENV_MAX_BYTES || 10 * 1024 * 1024);
+const MAX_PROJECTS = Number(process.env.INTER_ENV_MAX_PROJECTS || 100);
 const PAIR_TTL_MS = Number(process.env.INTER_ENV_PAIR_TTL_MS || 15 * 60 * 1000);
 const SERVER_TOKEN = process.env.INTER_ENV_SERVER_TOKEN || "";
 
@@ -151,9 +152,61 @@ app.use("/v1/accounts/:account/projects", (req, res, next) => {
   next();
 });
 
+app.put("/v1/accounts/:account/projects/:project", (req, res) => {
+  const { account, project } = req.params;
+  if (!validIds(res, account, project)) return;
+  if (!validDeletionSecret(account, requestBody(req))) {
+    res.status(401).type("text/plain").send("invalid deletion secret\n");
+    return;
+  }
+
+  if (registeredProjectExists(account, project)) {
+    res.status(204).send();
+    return;
+  }
+  if (registeredProjectCount(account) >= MAX_PROJECTS) {
+    res
+      .status(409)
+      .type("text/plain")
+      .send(`project limit reached (${MAX_PROJECTS}); delete a project before initializing another\n`);
+    return;
+  }
+
+  rmSync(projectRevokedFile(account, project), { force: true });
+  writeFileAtomic(projectMarkerFile(account, project), Buffer.alloc(0));
+  res.status(204).send();
+});
+
+app.delete("/v1/accounts/:account/projects/:project", (req, res) => {
+  const { account, project } = req.params;
+  if (!validIds(res, account, project)) return;
+  if (!validDeletionSecret(account, requestBody(req))) {
+    res.status(401).type("text/plain").send("invalid deletion secret\n");
+    return;
+  }
+
+  writeFileAtomic(projectRevokedFile(account, project), Buffer.alloc(0));
+  rmSync(projectDir(account, project), { recursive: true, force: true });
+  res.status(204).send();
+});
+
+app.use("/v1/accounts/:account/projects/:project", (req, res, next) => {
+  const { account, project } = req.params;
+  if (!validIds(res, account, project)) return;
+  if (existsSync(projectRevokedFile(account, project))) {
+    res.status(410).type("text/plain").send("project deleted\n");
+    return;
+  }
+  next();
+});
+
 app.put("/v1/accounts/:account/projects/:project/env", (req, res) => {
   const { account, project } = req.params;
   if (!validIds(res, account, project)) return;
+  if (!registeredProjectExists(account, project)) {
+    res.status(404).type("text/plain").send("project not initialized\n");
+    return;
+  }
 
   const body = requestBody(req);
   const revision = sha256(body);
@@ -314,6 +367,14 @@ function projectFile(account: string, project: string): string {
   return join(projectDir(account, project), "env.bin");
 }
 
+function projectMarkerFile(account: string, project: string): string {
+  return join(projectDir(account, project), "project");
+}
+
+function projectRevokedFile(account: string, project: string): string {
+  return join(accountDir(account), "revoked-projects", project);
+}
+
 function revisionFile(account: string, project: string): string {
   return join(projectDir(account, project), "env.rev");
 }
@@ -338,6 +399,31 @@ function sameSecret(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function validDeletionSecret(account: string, secret: Buffer): boolean {
+  const verifierFile = accountDeleteVerifierFile(account);
+  if (!existsSync(verifierFile) || secret.length === 0) return false;
+  const expected = readFileSync(verifierFile, "utf8").trim();
+  return sameSecret(expected, sha256(secret));
+}
+
+function registeredProjectExists(account: string, project: string): boolean {
+  const dir = projectDir(account, project);
+  return (
+    existsSync(projectMarkerFile(account, project)) ||
+    existsSync(revisionFile(account, project)) ||
+    existsSync(metadataFile(account, project)) ||
+    existsSync(dir) && readdirSync(dir).length > 0
+  );
+}
+
+function registeredProjectCount(account: string): number {
+  const projects = join(accountDir(account), "projects");
+  if (!existsSync(projects)) return 0;
+  return readdirSync(projects, { withFileTypes: true }).filter(
+    (entry) => entry.isDirectory() && registeredProjectExists(account, entry.name),
+  ).length;
 }
 
 type ProjectMetadata = {

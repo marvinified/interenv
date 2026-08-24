@@ -2,7 +2,7 @@
 
 set -eu
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
 INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
 CONFIG="$INTER_ENV_HOME/config"
@@ -24,6 +24,7 @@ Usage:
   interenv setup --link --server URL[/token] --code C
   interenv init [repo]                         Register and sync a Git repo
   interenv pair                                Create a one-time pairing code from this device
+  interenv project delete [repo]               Delete a synced project from the account
   interenv account delete                      Permanently delete this account and local state
   interenv sync [repo]                         Pull then push changed env files
   interenv pull [repo]                         Pull encrypted env files from the server
@@ -187,6 +188,14 @@ register_repo() {
   awk -F '\t' -v path="$repo" '$3 != path' "$REGISTRY" >"$tmp"
   printf '%s\t%s\t%s\n' "$remote" "$project" "$repo" >>"$tmp"
   mv "$tmp" "$REGISTRY"
+}
+
+unregister_project() {
+  project=$1
+  tmp="$REGISTRY.tmp.$$"
+  awk -F '\t' -v project="$project" '$2 != project' "$REGISTRY" >"$tmp"
+  mv "$tmp" "$REGISTRY"
+  rm -rf "$STATE_DIR/$project"
 }
 
 all_repos() {
@@ -377,6 +386,17 @@ http_put_status() {
   fi
 }
 
+http_put_result() {
+  path=$1
+  file=$2
+  response=$3
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -sS -o "$response" -w '%{http_code}' -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
+  else
+    curl -sS -o "$response" -w '%{http_code}' -X PUT --data-binary "@$file" "$(api_url "$path")"
+  fi
+}
+
 http_get() {
   path=$1
   file=$2
@@ -407,6 +427,17 @@ http_delete() {
   fi
 }
 
+http_delete_result() {
+  path=$1
+  file=$2
+  response=$3
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -sS -o "$response" -w '%{http_code}' -H "x-inter-env-token: $SERVER_TOKEN" -X DELETE --data-binary "@$file" "$(api_url "$path")"
+  else
+    curl -sS -o "$response" -w '%{http_code}' -X DELETE --data-binary "@$file" "$(api_url "$path")"
+  fi
+}
+
 parse_server_spec() {
   spec=$1
   parsed_server=$(printf '%s' "$spec" | sed 's#/$##')
@@ -427,6 +458,31 @@ register_account() {
     return 1
   fi
   rm -f "$verifier"
+}
+
+register_cloud_project() {
+  project=$1
+  secret="$INTER_ENV_HOME/project-secret.$$"
+  response="$INTER_ENV_HOME/project-response.$$"
+  printf '%s' "$DELETE_TOKEN" >"$secret"
+  chmod 600 "$secret"
+  if ! status=$(http_put_result "/v1/accounts/$ACCOUNT_ID/projects/$project" "$secret" "$response"); then
+    rm -f "$secret" "$response"
+    die "could not reach the sync server"
+  fi
+  case "$status" in
+    204) ;;
+    409)
+      message=$(sed -n '1p' "$response")
+      rm -f "$secret" "$response"
+      die "${message:-project limit reached; delete a project before initializing another}"
+      ;;
+    *)
+      rm -f "$secret" "$response"
+      die "server rejected project initialization (HTTP $status)"
+      ;;
+  esac
+  rm -f "$secret" "$response"
 }
 
 ack_revision() {
@@ -730,6 +786,7 @@ cmd_init() {
   repo=$(repo_root "$repo_arg") || die "not inside a Git repo"
   remote=$(remote_url "$repo") || die "repo has no origin remote"
   project=$(project_id "$remote")
+  register_cloud_project "$project"
   register_repo "$repo" "$remote" "$project"
   PULL_RESULT=""
   cmd_pull_repo "$repo"
@@ -742,6 +799,48 @@ cmd_init() {
   fi
   printf 'Registered %s\n' "$repo"
   printf 'Project id: %s\n' "$project"
+}
+
+cmd_project_delete() {
+  ensure_deps
+  ensure_home
+  load_config
+  confirmed=0
+  repo_arg="."
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes) confirmed=1 ;;
+      *) repo_arg=$1 ;;
+    esac
+    shift
+  done
+  repo=$(repo_root "$repo_arg") || die "not inside a Git repo"
+  remote=$(registered_remote "$repo" || true)
+  [ -n "$remote" ] || remote=$(remote_url "$repo") || die "repo has no origin remote"
+  project=$(registered_project "$repo" || true)
+  [ -n "$project" ] || project=$(project_id "$remote")
+  if [ "$confirmed" -ne 1 ]; then
+    printf 'This deletes synced cloud data for project %s. Local env files are kept.\n' "$project"
+    printf 'Type the project id to confirm: '
+    IFS= read -r confirmation
+    [ "$confirmation" = "$project" ] || die "project deletion cancelled"
+  fi
+
+  secret="$INTER_ENV_HOME/project-delete-secret.$$"
+  response="$INTER_ENV_HOME/project-delete-response.$$"
+  printf '%s' "$DELETE_TOKEN" >"$secret"
+  chmod 600 "$secret"
+  if ! status=$(http_delete_result "/v1/accounts/$ACCOUNT_ID/projects/$project" "$secret" "$response"); then
+    rm -f "$secret" "$response"
+    die "could not reach the sync server"
+  fi
+  if [ "$status" != "204" ]; then
+    rm -f "$secret" "$response"
+    die "server rejected project deletion (HTTP $status)"
+  fi
+  rm -f "$secret" "$response"
+  unregister_project "$project"
+  printf 'Deleted project %s from the account. Local env files were kept.\n' "$project"
 }
 
 sync_all() {
@@ -877,6 +976,13 @@ case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   init) shift; cmd_init "$@" ;;
   pair) shift; cmd_pair ;;
+  project)
+    shift
+    case "${1:-}" in
+      delete) shift; with_lock cmd_project_delete "$@" ;;
+      *) die "usage: interenv project delete [repo]" ;;
+    esac
+    ;;
   account)
     shift
     case "${1:-}" in

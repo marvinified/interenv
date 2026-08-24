@@ -2,9 +2,7 @@
 
 `inter-env` syncs `.env` and `.env.*` files across machines for the same Git project.
 
-The CLI command is `interenv`. By default it uses the hosted free service at `https://interenv.bytode.dev`. Run `interenv setup` once per machine, then run `interenv init` inside each repo you want to sync.
-
-Each user has one inter-env account key. Env files are encrypted on the device before upload, and the backend stores only encrypted files.
+No accounts needed. Each user has one inter-env user key and env files are encrypted on the device before upload, and the backend stores the encrypted files for syncing across paired devices.
 
 ## Install
 
@@ -14,17 +12,11 @@ Install the client:
 curl -fsSL https://interenv.bytode.dev/install.sh | sudo sh
 ```
 
-
-
 ## Requirements
 
 Client machines need:
 
-- `sh`
-- `git`
-- `curl`
-- `openssl`
-- `tar`
+`sh, git, curl, openssl, tar`
 
 macOS and most Linux machines already have these, except Git may need to be installed separately. Windows users should run `interenv` through Git Bash or WSL, not `cmd.exe` or PowerShell directly.
 
@@ -41,7 +33,7 @@ interenv init     # run inside each repo to sync
 
 Keep the recovery key printed during setup private.
 
-### Another Machine
+### Additonal Machines
 
 ```sh
 # On an existing machine
@@ -83,13 +75,17 @@ packages/web/.env.local
 
 It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`.
 
-Every five seconds, the client compares a small cloud metadata record with an account-keyed hash of local env paths and contents. Matching hashes require no env download. Blank lines, trailing newlines, and `CRLF` versus `LF` do not change the hash, but changing an env value or file path does.
+Every five seconds, the client compares a small remote metadata record with an account-keyed hash of local env paths and contents. Matching hashes require no env download. Blank lines, trailing newlines, and `CRLF` versus `LF` do not change the hash, but changing an env value or file path does.
 
-When hashes differ, a newer cloud timestamp pulls the encrypted snapshot; otherwise the local snapshot is packaged with `tar`, encrypted with the account key, and uploaded. The server never receives plaintext env contents or an unkeyed content hash.
+When hashes differ, a newer remote timestamp pulls the encrypted snapshot; otherwise the local snapshot is packaged with `tar`, encrypted with the account key, and uploaded. The server never receives plaintext env contents or an unkeyed content hash.
 
-On a repo's first `interenv init`, the client pulls an existing cloud copy before it considers uploading local files. Local files are uploaded only when no cloud copy exists. Creating a pairing code also refreshes registered project blobs so the new machine can pull even after normal server cleanup.
+On a repo's first `interenv init`, the client pulls an existing remote copy before it considers uploading local files. Local files are uploaded only when no remote copy exists. Creating a pairing code also refreshes registered project blobs so the new machine can pull even after normal server cleanup.
 
 Pairing codes use six uppercase, ambiguity-free characters. They are one-time, expire after 15 minutes by default, and protect the temporary key bundle with a deliberately expensive key-derivation step. Active codes are reserved atomically; if a collision occurs, the client generates another code before displaying it.
+
+## Hosted Server
+
+By default it uses the hosted free service at `https://interenv.bytode.dev`.
 
 To point the CLI at a private or self-hosted backend, pass a URL with a token:
 
@@ -132,6 +128,7 @@ HOST=0.0.0.0 \
 PORT=4010 \
 INTER_ENV_SERVER_DATA=/var/lib/inter-env \
 INTER_ENV_SERVER_TOKEN=my-token \
+INTER_ENV_MAX_PROJECTS=100 \
 yarn start
 ```
 
@@ -150,6 +147,18 @@ data/
 ```
 
 `env.bin` is encrypted before it reaches the server. Pairing files are encrypted key bundles and are deleted after they are used.
+
+## Project Limits
+
+The server allows up to 100 projects per account by default. Hosts can change this with `INTER_ENV_MAX_PROJECTS`.
+
+When the limit is reached, `interenv init` stops before registering the new repo. Delete an existing project to free a slot:
+
+```sh
+interenv project delete
+```
+
+This removes the project's remote data and local inter-env registration but keeps its local env files. Other paired devices cannot silently recreate the deleted project; running `interenv init` explicitly can add it again when a slot is available.
 
 ## Server Cleanup
 
@@ -181,6 +190,8 @@ To remove only the CLI and keep the account:
 interenv uninstall
 ```
 
+
+
 ## Commands
 
 ```sh
@@ -189,6 +200,7 @@ interenv setup --fresh --server URL[/token]  Create an account non-interactively
 interenv setup --link --server URL[/token] --code CODE
 interenv init [repo]                         Register and sync a Git repo
 interenv pair                                Create a one-time pairing code
+interenv project delete [repo]               Delete a synced project
 interenv account delete                      Delete the account and local state
 interenv sync [repo]                         Pull then push changed env files
 interenv pull [repo]                         Pull env files from the server
@@ -203,8 +215,6 @@ interenv uninstall                           Remove the CLI only
 interenv version                             Print the version
 ```
 
-
-
 ## Security Model
 
 - Env files are encrypted before upload.
@@ -216,3 +226,11 @@ interenv version                             Print the version
 - If someone gets your account key or recovery key, they can decrypt your env files.
 
 By default, deletion is not synced. If a linked project is missing an env file that exists in the encrypted server copy, `interenv pull` restores it.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and testing instructions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

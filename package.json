@@ -1,7 +1,8 @@
 {
   "name": "@inter-env/server",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
+  "license": "MIT",
   "description": "File-backed inter-env API server",
   "repository": {
     "type": "git",

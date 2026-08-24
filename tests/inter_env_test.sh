@@ -34,7 +34,7 @@ mkdir -p "$TMP"
 SERVER_ENTRY="$ROOT/dist/index.js"
 [ -f "$SERVER_ENTRY" ] || fail "missing compiled server; run yarn build"
 
-INTER_ENV_SERVER_DATA="$TMP/server-data" INTER_ENV_SERVER_TOKEN="testtoken" PORT="$PORT" node "$SERVER_ENTRY" >"$TMP/server.log" 2>&1 &
+INTER_ENV_SERVER_DATA="$TMP/server-data" INTER_ENV_SERVER_TOKEN="testtoken" INTER_ENV_MAX_PROJECTS=1 PORT="$PORT" node "$SERVER_ENTRY" >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
 
 i=0
@@ -126,6 +126,23 @@ printf '\n' >>"$TMP/device-a-repo/apps/api/.env"
 INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
 meta_after=$(curl -fsS -H "x-inter-env-token: testtoken" "$meta_url")
 [ "$meta_before" = "$meta_after" ] || fail "blank line changed the canonical env hash"
+
+git init -q "$TMP/device-a-new-repo"
+git -C "$TMP/device-a-new-repo" remote add origin https://github.com/example/new-app.git
+printf 'NEW=1\n' >"$TMP/device-a-new-repo/.env"
+if INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-a-new-repo" >"$TMP/project-limit.log" 2>&1; then
+  fail "server allowed initialization beyond the project limit"
+fi
+grep -q 'project limit reached (1)' "$TMP/project-limit.log" || fail "project limit error was not actionable"
+
+INTER_ENV_HOME="$TMP/device-a-home" interenv project delete "$TMP/device-a-repo" --yes >/dev/null
+[ ! -d "$TMP/server-data/accounts/$account_id/projects/$project_id" ] || fail "project deletion kept server data"
+if INTER_ENV_HOME="$TMP/device-b-home" interenv push "$TMP/device-b-repo" >/dev/null 2>&1; then
+  fail "another device recreated a deleted project"
+fi
+INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-a-new-repo" >/dev/null
+new_project_id=$(awk -F '\t' 'NR == 1 {print $2}' "$TMP/device-a-home/repos.tsv")
+[ -d "$TMP/server-data/accounts/$account_id/projects/$new_project_id" ] || fail "deleted project did not free a project slot"
 
 account_id=$(sed -n "s/^ACCOUNT_ID='\([^']*\)'$/\1/p" "$TMP/device-b-home/config")
 [ -n "$account_id" ] || fail "account id missing from device config"
