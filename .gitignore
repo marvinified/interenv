@@ -8,5 +8,4 @@ dist/
 build/
 *.egg-info/
 node_modules/
-server/dist/
-server/.yarn-cache/
+.yarn-cache/

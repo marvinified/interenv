@@ -31,8 +31,8 @@ assert_file_contains() {
 }
 
 mkdir -p "$TMP"
-SERVER_ENTRY="$ROOT/server/dist/index.js"
-[ -f "$SERVER_ENTRY" ] || fail "missing compiled server; run yarn build in server/"
+SERVER_ENTRY="$ROOT/dist/index.js"
+[ -f "$SERVER_ENTRY" ] || fail "missing compiled server; run yarn build"
 
 INTER_ENV_SERVER_DATA="$TMP/server-data" INTER_ENV_SERVER_TOKEN="testtoken" PORT="$PORT" node "$SERVER_ENTRY" >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
@@ -52,8 +52,16 @@ curl -fsS -H "x-inter-env-token: testtoken" "http://127.0.0.1:$PORT/health" >/de
 
 root_body=$(curl -fsS "http://127.0.0.1:$PORT/")
 printf '%s\n' "$root_body" | grep -q 'inter-env' || fail "root route missing service name"
+printf '%s\n' "$root_body" | grep -q 'https://interenv.bytode.dev/install.sh' || fail "root route missing install URL"
 printf '%s\n' "$root_body" | grep -q 'https://github.com/marvinified/interenv' || fail "root route missing repo link"
 printf '%s\n' "$root_body" | grep -q 'https://bytode.dev' || fail "root route missing blog link"
+
+curl -fsS "http://127.0.0.1:$PORT/install.sh" >"$TMP/install.sh"
+grep -q '^#!/bin/sh$' "$TMP/install.sh" || fail "server did not serve install.sh"
+grep -q 'https://interenv.bytode.dev/interenv' "$TMP/install.sh" || fail "served installer does not download from deployed server"
+
+curl -fsS "http://127.0.0.1:$PORT/interenv" >"$TMP/interenv"
+grep -q '^#!/bin/sh$' "$TMP/interenv" || fail "server did not serve interenv client"
 
 git init -q "$TMP/device-a-repo"
 git init -q "$TMP/device-b-repo"

@@ -8,16 +8,16 @@ Each user has one inter-env account key. Env files are encrypted on the device b
 
 ## Install
 
-Install the client from GitHub:
+Install the client:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/marvinified/interenv/main/install.sh | sh
+curl -fsSL https://interenv.bytode.dev/install.sh | sh
 ```
 
 If `/usr/local/bin` needs permissions:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/marvinified/interenv/main/install.sh | sudo sh
+curl -fsSL https://interenv.bytode.dev/install.sh | sudo sh
 ```
 
 ## Requirements
@@ -132,11 +132,20 @@ The client stores `https://private.example.com` as the server URL and sends `my-
 On your server:
 
 ```sh
-cd server
 yarn install
 yarn build
 yarn start
 ```
+
+For Coolify, use the repository root (`/`) with:
+
+```text
+Build command: yarn build
+Start command: yarn start
+Port: 4010
+```
+
+Mount persistent storage for the data directory and set `INTER_ENV_SERVER_DATA` to that mount path.
 
 Optional settings:
 
@@ -148,7 +157,7 @@ INTER_ENV_SERVER_TOKEN=my-token \
 yarn start
 ```
 
-See `server/.env.example` for all server settings.
+See `.env.example` for all server settings.
 
 Use HTTPS in front of the backend for real devices. The env payloads are encrypted before upload, but HTTPS still protects pairing codes and request metadata in transit.
 

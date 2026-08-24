@@ -17,7 +17,7 @@ import express = require("express");
 import type { ErrorRequestHandler, Request, Response } from "express";
 
 const PORT = Number(process.env.PORT || process.env.INTER_ENV_SERVER_PORT || 4010);
-const HOST = process.env.HOST || process.env.INTER_ENV_SERVER_HOST || "127.0.0.1";
+const HOST = process.env.HOST || process.env.INTER_ENV_SERVER_HOST || "0.0.0.0";
 const DATA_DIR = process.env.INTER_ENV_SERVER_DATA || join(process.cwd(), "data");
 const MAX_BYTES = Number(process.env.INTER_ENV_MAX_BYTES || 10 * 1024 * 1024);
 const PAIR_TTL_MS = Number(process.env.INTER_ENV_PAIR_TTL_MS || 15 * 60 * 1000);
@@ -33,6 +33,7 @@ app.get("/", (_req, res) => {
       "Encrypted .env sync across machines.",
       "",
       "CLI: interenv init",
+      "Install: curl -fsSL https://interenv.bytode.dev/install.sh | sh",
       "Health: /health",
       "API: /v1",
       "",
@@ -41,6 +42,14 @@ app.get("/", (_req, res) => {
       "",
     ].join("\n"),
   );
+});
+
+app.get("/install.sh", (_req, res) => {
+  res.type("text/x-shellscript").sendFile(join(__dirname, "install.sh"));
+});
+
+app.get("/interenv", (_req, res) => {
+  res.type("text/x-shellscript").sendFile(join(__dirname, "interenv"));
 });
 
 app.use(express.raw({ type: "*/*", limit: MAX_BYTES }));
