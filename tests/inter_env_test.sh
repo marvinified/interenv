@@ -78,6 +78,10 @@ INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/dev
 
 code=$(INTER_ENV_HOME="$TMP/device-a-home" interenv pair | awk '/Pairing code:/ {print $3}')
 [ -n "$code" ] || fail "pairing code was not generated"
+printf '%s\n' "$code" | grep -Eq '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$' || fail "pairing code is not 6 uppercase characters"
+printf 'duplicate' >"$TMP/duplicate-pair"
+duplicate_status=$(curl -sS -o /dev/null -w '%{http_code}' -H "x-inter-env-token: testtoken" -X PUT --data-binary "@$TMP/duplicate-pair" "http://127.0.0.1:$PORT/v1/pair/$code")
+[ "$duplicate_status" = "409" ] || fail "server did not reject an active duplicate pairing code"
 
 INTER_ENV_HOME="$TMP/device-b-home" interenv setup --link --server "$SERVER_URL" --code "$code" >/dev/null
 INTER_ENV_HOME="$TMP/device-b-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-b-repo" >/dev/null

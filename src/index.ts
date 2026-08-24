@@ -177,15 +177,18 @@ app.put("/v1/accounts/:account/projects/:project/devices/:device", (req, res) =>
 
 app.put("/v1/pair/:pairId", (req, res) => {
   const { pairId } = req.params;
-  if (!validIds(res, pairId)) return;
+  if (!validPairCode(res, pairId)) return;
 
-  writeFileAtomic(pairFile(pairId), requestBody(req));
+  if (!writePairFileOnce(pairId, requestBody(req))) {
+    res.status(409).type("text/plain").send("pairing code already active\n");
+    return;
+  }
   res.status(204).send();
 });
 
 app.get("/v1/pair/:pairId", (req, res) => {
   const { pairId } = req.params;
-  if (!validIds(res, pairId)) return;
+  if (!validPairCode(res, pairId)) return;
 
   const file = pairFile(pairId);
   if (!existsSync(file)) {
@@ -219,6 +222,13 @@ function validIds(res: Response, ...ids: string[]): boolean {
   return false;
 }
 
+function validPairCode(res: Response, code: string): boolean {
+  if (/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/.test(code)) return true;
+
+  res.status(400).type("text/plain").send("invalid pairing code\n");
+  return false;
+}
+
 function requestBody(req: Request): Buffer {
   return Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 }
@@ -228,6 +238,18 @@ function writeFileAtomic(file: string, body: Buffer): void {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, body, { mode: 0o600 });
   renameSync(tmp, file);
+}
+
+function writePairFileOnce(pairId: string, body: Buffer): boolean {
+  const file = pairFile(pairId);
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(file, body, { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
 }
 
 function projectDir(account: string, project: string): string {

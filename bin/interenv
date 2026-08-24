@@ -2,7 +2,7 @@
 
 set -eu
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
 INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
 CONFIG="$INTER_ENV_HOME/config"
@@ -12,6 +12,7 @@ LOCK_DIR="$INTER_ENV_HOME/lock"
 LOG_FILE="$INTER_ENV_HOME/inter-env.log"
 PID_FILE="$INTER_ENV_HOME/inter-env.pid"
 INTERVAL="${INTER_ENV_INTERVAL:-10}"
+PAIR_KDF_ITERATIONS=200000
 
 usage() {
   cat <<'EOF'
@@ -120,6 +121,16 @@ random_hex() {
 
 random_b64() {
   openssl rand -base64 "$1" | tr -d '\n'
+}
+
+random_pair_code() {
+  while :; do
+    code=$(openssl rand -base64 48 | tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' | cut -c 1-6)
+    [ "${#code}" -eq 6 ] && {
+      printf '%s\n' "$code"
+      return
+    }
+  done
 }
 
 sha256() {
@@ -241,6 +252,20 @@ decrypt_file() {
   INTER_ENV_SECRET=$pass openssl enc -d -aes-256-cbc -pbkdf2 -in "$input" -out "$output" -pass env:INTER_ENV_SECRET
 }
 
+encrypt_pair_file() {
+  input=$1
+  output=$2
+  pass=$3
+  INTER_ENV_SECRET=$pass openssl enc -aes-256-cbc -pbkdf2 -iter "$PAIR_KDF_ITERATIONS" -salt -in "$input" -out "$output" -pass env:INTER_ENV_SECRET
+}
+
+decrypt_pair_file() {
+  input=$1
+  output=$2
+  pass=$3
+  INTER_ENV_SECRET=$pass openssl enc -d -aes-256-cbc -pbkdf2 -iter "$PAIR_KDF_ITERATIONS" -in "$input" -out "$output" -pass env:INTER_ENV_SECRET
+}
+
 api_url() {
   path=$1
   base=$(printf '%s' "$SERVER_URL" | sed 's#/$##')
@@ -264,6 +289,16 @@ http_put_capture() {
     curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
   else
     curl -fsS -X PUT --data-binary "@$file" "$(api_url "$path")"
+  fi
+}
+
+http_put_status() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -sS -o /dev/null -w '%{http_code}' -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
+  else
+    curl -sS -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$file" "$(api_url "$path")"
   fi
 }
 
@@ -341,10 +376,8 @@ setup_fresh() {
 
 setup_link() {
   parse_server_spec "$1"
-  code=$2
-  pair_id=$(printf '%s' "$code" | sed 's/-.*$//')
-  pair_secret=$(printf '%s' "$code" | sed 's/^[^-]*-//')
-  [ "$pair_id" != "$pair_secret" ] || die "pairing code must look like id-secret"
+  code=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')
+  printf '%s\n' "$code" | grep -Eq '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$' || die "pairing code must be 6 characters"
   ensure_home
   enc="$INTER_ENV_HOME/pair.enc.$$"
   plain="$INTER_ENV_HOME/pair.plain.$$"
@@ -352,11 +385,11 @@ setup_link() {
   SERVER_TOKEN=$parsed_token
   export SERVER_URL
   export SERVER_TOKEN
-  if ! http_get "/v1/pair/$pair_id" "$enc"; then
+  if ! http_get "/v1/pair/$code" "$enc"; then
     rm -f "$enc" "$plain"
     die "pairing code not found or expired"
   fi
-  if ! decrypt_file "$enc" "$plain" "$pair_secret" 2>/dev/null; then
+  if ! decrypt_pair_file "$enc" "$plain" "$code" 2>/dev/null; then
     rm -f "$enc" "$plain"
     die "could not decrypt pairing bundle; check the code"
   fi
@@ -395,9 +428,6 @@ cmd_pair() {
   ensure_home
   load_config
   register_account
-  pair_id=$(random_hex 4)
-  pair_secret=$(random_hex 16)
-  code="$pair_id-$pair_secret"
   plain="$INTER_ENV_HOME/pair.plain.$$"
   enc="$INTER_ENV_HOME/pair.enc.$$"
   {
@@ -406,8 +436,27 @@ cmd_pair() {
     printf '%s\n' "$DELETE_TOKEN"
   } >"$plain"
   chmod 600 "$plain"
-  encrypt_file "$plain" "$enc" "$pair_secret"
-  http_put "/v1/pair/$pair_id" "$enc"
+  attempts=0
+  while [ "$attempts" -lt 10 ]; do
+    code=$(random_pair_code)
+    encrypt_pair_file "$plain" "$enc" "$code"
+    if ! status=$(http_put_status "/v1/pair/$code" "$enc"); then
+      rm -f "$plain" "$enc"
+      die "could not reach the pairing server"
+    fi
+    case "$status" in
+      204) break ;;
+      409) attempts=$((attempts + 1)) ;;
+      *)
+        rm -f "$plain" "$enc"
+        die "server rejected pairing request (HTTP $status)"
+        ;;
+    esac
+  done
+  [ "$attempts" -lt 10 ] || {
+    rm -f "$plain" "$enc"
+    die "could not allocate a unique pairing code"
+  }
   rm -f "$plain" "$enc"
   printf 'Pairing code: %s\n' "$code"
   printf 'Use it on the new device with: interenv setup\n'

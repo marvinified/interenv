@@ -45,7 +45,7 @@ Keep the recovery key printed during setup private.
 
 ```sh
 # On an existing machine
-interenv pair # returns a pairing code
+interenv pair # returns a 6-character pairing code
 
 # On the new machine
 interenv setup    # choose "Link this device" and enter the pairing code
@@ -86,6 +86,8 @@ It skips common generated or dependency directories, including `.git`, `node_mod
 When a watched env file changes, the client packages the env files with `tar`, encrypts the package with the local account key using `openssl`, and uploads the encrypted blob to the backend.
 
 Other linked machines periodically pull the encrypted blob, decrypt it locally, and apply the env files to the matching Git project.
+
+Pairing codes use six uppercase, ambiguity-free characters. They are one-time, expire after 15 minutes by default, and protect the temporary key bundle with a deliberately expensive key-derivation step. Active codes are reserved atomically; if a collision occurs, the client generates another code before displaying it.
 
 To point the CLI at a private or self-hosted backend, pass a URL with a token:
 
