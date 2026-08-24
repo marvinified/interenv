@@ -83,9 +83,11 @@ packages/web/.env.local
 
 It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`.
 
-When a watched env file changes, the client packages the env files with `tar`, encrypts the package with the local account key using `openssl`, and uploads the encrypted blob to the backend.
+Every five seconds, the client compares a small cloud metadata record with an account-keyed hash of local env paths and contents. Matching hashes require no env download. Blank lines, trailing newlines, and `CRLF` versus `LF` do not change the hash, but changing an env value or file path does.
 
-Other linked machines periodically pull the encrypted blob, decrypt it locally, and apply the env files to the matching Git project.
+When hashes differ, a newer cloud timestamp pulls the encrypted snapshot; otherwise the local snapshot is packaged with `tar`, encrypted with the account key, and uploaded. The server never receives plaintext env contents or an unkeyed content hash.
+
+On a repo's first `interenv init`, the client pulls an existing cloud copy before it considers uploading local files. Local files are uploaded only when no cloud copy exists. Creating a pairing code also refreshes registered project blobs so the new machine can pull even after normal server cleanup.
 
 Pairing codes use six uppercase, ambiguity-free characters. They are one-time, expire after 15 minutes by default, and protect the temporary key bundle with a deliberately expensive key-derivation step. Active codes are reserved atomically; if a collision occurs, the client generates another code before displaying it.
 
@@ -194,7 +196,7 @@ interenv push [repo]                         Upload local env files
 interenv watch                               Run the watcher in the foreground
 interenv start                               Start the watcher in the background
 interenv stop                                Stop the watcher
-interenv status                              Show account, watcher, and repo status
+interenv status                              Verify account and show watcher/repo status
 interenv list                                List registered repos
 interenv upgrade                             Upgrade the CLI
 interenv uninstall                           Remove the CLI only

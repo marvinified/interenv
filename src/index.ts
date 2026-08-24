@@ -69,6 +69,22 @@ app.get("/health", (_req, res) => {
   res.type("text/plain").send("ok\n");
 });
 
+app.get("/v1/accounts/:account", (req, res) => {
+  const { account } = req.params;
+  if (!validIds(res, account)) return;
+
+  if (existsSync(accountRevokedFile(account))) {
+    res.status(410).type("text/plain").send("deleted\n");
+    return;
+  }
+  if (!existsSync(accountDeleteVerifierFile(account))) {
+    res.status(404).type("text/plain").send("not found\n");
+    return;
+  }
+
+  res.type("text/plain").send("active\n");
+});
+
 app.put("/v1/accounts/:account", (req, res) => {
   const { account } = req.params;
   if (!validIds(res, account)) return;
@@ -141,9 +157,35 @@ app.put("/v1/accounts/:account/projects/:project/env", (req, res) => {
 
   const body = requestBody(req);
   const revision = sha256(body);
+  const suppliedContentHash = req.header("x-inter-env-content-hash") || "";
+  if (suppliedContentHash && !/^[a-f0-9]{64}$/.test(suppliedContentHash)) {
+    res.status(400).type("text/plain").send("invalid content hash\n");
+    return;
+  }
+  const contentHash = suppliedContentHash || revision;
   writeFileAtomic(projectFile(account, project), body);
   writeFileAtomic(revisionFile(account, project), Buffer.from(`${revision}\n`));
+  writeProjectMetadata(account, project, {
+    revision,
+    contentHash,
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
   res.type("text/plain").send(`${revision}\n`);
+});
+
+app.get("/v1/accounts/:account/projects/:project/meta", (req, res) => {
+  const { account, project } = req.params;
+  if (!validIds(res, account, project)) return;
+
+  const metadata = readProjectMetadata(account, project);
+  if (!metadata) {
+    res.status(404).type("text/plain").send("not found\n");
+    return;
+  }
+
+  res
+    .type("text/plain")
+    .send(`${metadata.revision}\t${metadata.contentHash}\t${metadata.updatedAt}\n`);
 });
 
 app.get("/v1/accounts/:account/projects/:project/env", (req, res) => {
@@ -276,6 +318,10 @@ function revisionFile(account: string, project: string): string {
   return join(projectDir(account, project), "env.rev");
 }
 
+function metadataFile(account: string, project: string): string {
+  return join(projectDir(account, project), "env.meta.json");
+}
+
 function deviceFile(account: string, project: string, device: string): string {
   return join(projectDir(account, project), "devices", `${device}.rev`);
 }
@@ -292,6 +338,44 @@ function sameSecret(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+type ProjectMetadata = {
+  revision: string;
+  contentHash: string;
+  updatedAt: number;
+};
+
+function writeProjectMetadata(account: string, project: string, metadata: ProjectMetadata): void {
+  writeFileAtomic(metadataFile(account, project), Buffer.from(`${JSON.stringify(metadata)}\n`));
+}
+
+function readProjectMetadata(account: string, project: string): ProjectMetadata | null {
+  const file = metadataFile(account, project);
+  if (existsSync(file)) {
+    try {
+      const metadata = JSON.parse(readFileSync(file, "utf8")) as ProjectMetadata;
+      if (
+        safeId(metadata.revision) &&
+        /^[a-f0-9]{64}$/.test(metadata.contentHash) &&
+        Number.isFinite(metadata.updatedAt)
+      ) {
+        return metadata;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const revisionPath = revisionFile(account, project);
+  if (!existsSync(revisionPath)) return null;
+  const revision = readFileSync(revisionPath, "utf8").trim();
+  if (!safeId(revision)) return null;
+  return {
+    revision,
+    contentHash: revision,
+    updatedAt: Math.floor(statSync(revisionPath).mtimeMs / 1000),
+  };
 }
 
 function cleanPairFiles(): void {

@@ -11,7 +11,7 @@ STATE_DIR="$INTER_ENV_HOME/state"
 LOCK_DIR="$INTER_ENV_HOME/lock"
 LOG_FILE="$INTER_ENV_HOME/inter-env.log"
 PID_FILE="$INTER_ENV_HOME/inter-env.pid"
-INTERVAL="${INTER_ENV_INTERVAL:-10}"
+INTERVAL="${INTER_ENV_INTERVAL:-5}"
 PAIR_KDF_ITERATIONS=200000
 
 usage() {
@@ -31,7 +31,7 @@ Usage:
   interenv watch                               Run the foreground watcher loop
   interenv start                               Start the background watcher
   interenv stop                                Stop the background watcher
-  interenv status                              Show account, watcher, and repo status
+  interenv status                              Verify account and show watcher/repo status
   interenv list                                List registered repos
   interenv upgrade                             Upgrade from interenv.bytode.dev
   interenv uninstall                           Remove the interenv CLI
@@ -41,7 +41,7 @@ Environment:
   INTER_ENV_HOME                               State directory, default ~/.inter-env
   INTER_ENV_SERVER_URL                         Override server URL, optionally URL/token
   INTER_ENV_DEFAULT_SERVER_URL                 Hosted service URL baked into the client
-  INTER_ENV_INTERVAL                           Watch poll interval in seconds, default 10
+  INTER_ENV_INTERVAL                           Watch poll interval in seconds, default 5
 EOF
 }
 
@@ -67,6 +67,7 @@ ensure_deps() {
   need cksum
   need awk
   need sed
+  need stat
 }
 
 ensure_home() {
@@ -233,6 +234,43 @@ env_signature() {
   done
 }
 
+canonical_file_hash() {
+  awk '{ sub(/\r$/, ""); if ($0 !~ /^[[:space:]]*$/) print }' "$1" | openssl dgst -sha256 -r | awk '{print $1}'
+}
+
+env_content_hash() {
+  repo=$1
+  manifest="$INTER_ENV_HOME/hash-manifest.$$"
+  env_files "$repo" | sort | while IFS= read -r name; do
+    printf '%s\t%s\n' "$name" "$(canonical_file_hash "$repo/$name")"
+  done >"$manifest"
+  manifest_hash=$(openssl dgst -sha256 -r "$manifest" | awk '{print $1}')
+  rm -f "$manifest"
+  sha256 "$ACCOUNT_KEY:$manifest_hash"
+}
+
+file_mtime() {
+  if value=$(stat -f '%m' "$1" 2>/dev/null); then
+    printf '%s\n' "$value"
+  else
+    stat -c '%Y' "$1"
+  fi
+}
+
+env_updated_at() {
+  repo=$1
+  list="$INTER_ENV_HOME/mtime-files.$$"
+  env_files "$repo" | sort >"$list"
+  latest=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    modified=$(file_mtime "$repo/$name")
+    [ "$modified" -le "$latest" ] || latest=$modified
+  done <"$list"
+  rm -f "$list"
+  printf '%s\n' "$latest"
+}
+
 has_env_files() {
   repo=$1
   [ -n "$(env_files "$repo" | sed -n '1p')" ]
@@ -285,11 +323,48 @@ http_put() {
 http_put_capture() {
   path=$1
   file=$2
+  content_hash=${3:-}
   if [ -n "${SERVER_TOKEN:-}" ]; then
-    curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
+    if [ -n "$content_hash" ]; then
+      curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -H "x-inter-env-content-hash: $content_hash" -X PUT --data-binary "@$file" "$(api_url "$path")"
+    else
+      curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X PUT --data-binary "@$file" "$(api_url "$path")"
+    fi
   else
-    curl -fsS -X PUT --data-binary "@$file" "$(api_url "$path")"
+    if [ -n "$content_hash" ]; then
+      curl -fsS -H "x-inter-env-content-hash: $content_hash" -X PUT --data-binary "@$file" "$(api_url "$path")"
+    else
+      curl -fsS -X PUT --data-binary "@$file" "$(api_url "$path")"
+    fi
   fi
+}
+
+fetch_project_meta() {
+  project=$1
+  meta="$INTER_ENV_HOME/project-meta.$$"
+  if ! status=$(http_get_status "/v1/accounts/$ACCOUNT_ID/projects/$project/meta" "$meta"); then
+    rm -f "$meta"
+    die "could not reach the sync server"
+  fi
+  case "$status" in
+    200)
+      REMOTE_EXISTS=1
+      REMOTE_REVISION=$(awk -F '\t' 'NR == 1 {print $1}' "$meta")
+      REMOTE_HASH=$(awk -F '\t' 'NR == 1 {print $2}' "$meta")
+      REMOTE_UPDATED=$(awk -F '\t' 'NR == 1 {print $3}' "$meta")
+      ;;
+    404)
+      REMOTE_EXISTS=0
+      REMOTE_REVISION=""
+      REMOTE_HASH=""
+      REMOTE_UPDATED=0
+      ;;
+    *)
+      rm -f "$meta"
+      die "server rejected project metadata request (HTTP $status)"
+      ;;
+  esac
+  rm -f "$meta"
 }
 
 http_put_status() {
@@ -309,6 +384,16 @@ http_get() {
     curl -fs -H "x-inter-env-token: $SERVER_TOKEN" -o "$file" "$(api_url "$path")"
   else
     curl -fs -o "$file" "$(api_url "$path")"
+  fi
+}
+
+http_get_status() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -sS -o "$file" -w '%{http_code}' -H "x-inter-env-token: $SERVER_TOKEN" "$(api_url "$path")"
+  else
+    curl -sS -o "$file" -w '%{http_code}' "$(api_url "$path")"
   fi
 }
 
@@ -428,6 +513,10 @@ cmd_pair() {
   ensure_home
   load_config
   register_account
+  all_repos | while IFS= read -r repo; do
+    [ -d "$repo/.git" ] || continue
+    cmd_push_repo "$repo" >/dev/null
+  done
   plain="$INTER_ENV_HOME/pair.plain.$$"
   enc="$INTER_ENV_HOME/pair.enc.$$"
   {
@@ -487,21 +576,34 @@ cmd_pull_repo() {
   register_repo "$repo" "$remote" "$project"
   enc="$INTER_ENV_HOME/pull.enc.$$"
   tarfile="$INTER_ENV_HOME/pull.tar.$$"
-  if http_get "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc"; then
-    revision=$(file_sha256 "$enc")
-    decrypt_file "$enc" "$tarfile" "$ACCOUNT_KEY" || {
-      rm -f "$enc" "$tarfile"
-      die "server data could not be decrypted with this account key"
-    }
-    tar -xf "$tarfile" -C "$repo"
-    env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
-    ack_revision "$project" "$revision"
+  if ! status=$(http_get_status "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc"); then
     rm -f "$enc" "$tarfile"
-    printf 'Pulled env files for %s\n' "$repo"
-  else
-    rm -f "$enc" "$tarfile"
-    printf 'No remote env files found for this project yet.\n'
+    die "could not reach the sync server"
   fi
+  case "$status" in
+    200) ;;
+    404)
+      rm -f "$enc" "$tarfile"
+      PULL_RESULT=missing
+      printf 'No remote env files found for this project yet.\n'
+      return 0
+      ;;
+    *)
+      rm -f "$enc" "$tarfile"
+      die "server rejected env download (HTTP $status)"
+      ;;
+  esac
+  revision=$(file_sha256 "$enc")
+  decrypt_file "$enc" "$tarfile" "$ACCOUNT_KEY" || {
+    rm -f "$enc" "$tarfile"
+    die "server data could not be decrypted with this account key"
+  }
+  tar -xf "$tarfile" -C "$repo"
+  env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
+  ack_revision "$project" "$revision"
+  rm -f "$enc" "$tarfile"
+  PULL_RESULT=pulled
+  printf 'Pulled env files for %s\n' "$repo"
 }
 
 cmd_push_repo() {
@@ -519,8 +621,9 @@ cmd_push_repo() {
   tarfile="$INTER_ENV_HOME/push.tar.$$"
   enc="$INTER_ENV_HOME/push.enc.$$"
   package_env "$repo" "$tarfile" || return 0
+  content_hash=$(env_content_hash "$repo")
   encrypt_file "$tarfile" "$enc" "$ACCOUNT_KEY"
-  revision=$(http_put_capture "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc" | sed -n '1p')
+  revision=$(http_put_capture "/v1/accounts/$ACCOUNT_ID/projects/$project/env" "$enc" "$content_hash" | sed -n '1p')
   [ -n "$revision" ] || revision=$(file_sha256 "$enc")
   env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
   ack_revision "$project" "$revision"
@@ -536,17 +639,30 @@ cmd_sync_repo() {
   project=$(registered_project "$repo" || true)
   [ -n "$project" ] || project=$(project_id "$remote")
   register_repo "$repo" "$remote" "$project"
-  state=$(repo_state_file "$project" "$repo")
-  before="$INTER_ENV_HOME/before.$$"
-  env_signature "$repo" >"$before"
-  changed=1
-  [ -f "$state" ] && cmp -s "$before" "$state" && changed=0
-  rm -f "$before"
-  if [ "$changed" -eq 1 ] && has_env_files "$repo"; then
+  fetch_project_meta "$project"
+  if ! has_env_files "$repo"; then
+    [ "$REMOTE_EXISTS" -eq 0 ] || cmd_pull_repo "$repo" >/dev/null
+    return 0
+  fi
+
+  local_hash=$(env_content_hash "$repo")
+  local_updated=$(env_updated_at "$repo")
+  if [ "$REMOTE_EXISTS" -eq 0 ]; then
     cmd_push_repo "$repo" >/dev/null
-    log "synced local changes for $repo"
+    log "pushed new project data for $repo"
+  elif [ "$local_hash" = "$REMOTE_HASH" ]; then
+    ack_revision "$project" "$REMOTE_REVISION"
+    env_signature "$repo" >"$(repo_state_file "$project" "$repo")"
+  elif [ "$REMOTE_HASH" = "$REMOTE_REVISION" ]; then
+    cmd_pull_repo "$repo" >/dev/null
+    cmd_push_repo "$repo" >/dev/null
+    log "migrated project metadata for $repo"
+  elif [ "$REMOTE_UPDATED" -gt "$local_updated" ]; then
+    cmd_pull_repo "$repo" >/dev/null
+    log "pulled newer project data for $repo"
   else
-    cmd_pull_repo "$repo" >/dev/null || true
+    cmd_push_repo "$repo" >/dev/null
+    log "pushed newer local data for $repo"
   fi
 }
 
@@ -615,7 +731,11 @@ cmd_init() {
   remote=$(remote_url "$repo") || die "repo has no origin remote"
   project=$(project_id "$remote")
   register_repo "$repo" "$remote" "$project"
-  cmd_sync_repo "$repo"
+  PULL_RESULT=""
+  cmd_pull_repo "$repo"
+  if [ "$PULL_RESULT" = "missing" ] && has_env_files "$repo"; then
+    cmd_push_repo "$repo"
+  fi
   install_hooks "$repo"
   if [ "${INTER_ENV_NO_START:-0}" != "1" ]; then
     cmd_start >/dev/null 2>&1 || true
@@ -672,7 +792,19 @@ cmd_status() {
   ensure_home
   if [ -f "$CONFIG" ]; then
     load_config
-    printf 'Account: %s\n' "$ACCOUNT_ID"
+    status_file="$INTER_ENV_HOME/account-status.$$"
+    if account_status=$(http_get_status "/v1/accounts/$ACCOUNT_ID" "$status_file"); then
+      case "$account_status" in
+        200) account_state=active ;;
+        404) account_state="not found" ;;
+        410) account_state=deleted ;;
+        *) account_state="server error (HTTP $account_status)" ;;
+      esac
+    else
+      account_state=unreachable
+    fi
+    rm -f "$status_file"
+    printf 'Account: %s (%s)\n' "$ACCOUNT_ID" "$account_state"
     printf 'Server: %s\n' "$SERVER_URL"
   else
     printf 'Account: not configured\n'
