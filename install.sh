@@ -19,4 +19,4 @@ fi
 
 chmod +x "$TARGET"
 printf 'Installed interenv to %s\n' "$TARGET"
-printf 'Run "interenv init" inside each repo you want to sync.\n'
+printf 'Run "interenv setup" once, then "interenv init" inside each repo you want to sync.\n'

@@ -2,7 +2,7 @@
 
 set -eu
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
 INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
 CONFIG="$INTER_ENV_HOME/config"
@@ -18,10 +18,12 @@ usage() {
 inter-env - encrypted .env sync across machines
 
 Usage:
-  interenv init [repo]                         Set up account/link device, register repo, sync
-  interenv init --fresh --server URL[/token]   Non-interactive fresh setup
-  interenv init --link --server URL[/token] --code C
+  interenv setup                               Create an account or link this machine
+  interenv setup --fresh --server URL[/token]  Non-interactive fresh setup
+  interenv setup --link --server URL[/token] --code C
+  interenv init [repo]                         Register and sync a Git repo
   interenv pair                                Create a one-time pairing code from this device
+  interenv account delete                      Permanently delete this account and local state
   interenv sync [repo]                         Pull then push changed env files
   interenv pull [repo]                         Pull encrypted env files from the server
   interenv push [repo]                         Encrypt and upload local env files
@@ -30,7 +32,8 @@ Usage:
   interenv stop                                Stop the background watcher
   interenv status                              Show account, watcher, and repo status
   interenv list                                List registered repos
-  interenv install                             Install from GitHub
+  interenv upgrade                             Upgrade from interenv.bytode.dev
+  interenv uninstall                           Remove the interenv CLI
   interenv version                             Print version
 
 Environment:
@@ -72,15 +75,19 @@ ensure_home() {
 }
 
 load_config() {
-  [ -f "$CONFIG" ] || die "no account configured; run interenv init"
+  [ -f "$CONFIG" ] || die "no account configured; run interenv setup"
   # shellcheck disable=SC1090
   . "$CONFIG"
   [ "${SERVER_URL:-}" ] || die "config missing SERVER_URL"
   [ "${ACCOUNT_ID:-}" ] || die "config missing ACCOUNT_ID"
   [ "${ACCOUNT_KEY:-}" ] || die "config missing ACCOUNT_KEY"
+  if [ -z "${DELETE_TOKEN:-}" ]; then
+    DELETE_TOKEN=$(sha256 "inter-env-delete:$ACCOUNT_KEY")
+    save_config "$SERVER_URL" "$ACCOUNT_ID" "$ACCOUNT_KEY" "${DEVICE_ID:-$(random_hex 8)}" "${SERVER_TOKEN:-}" "$DELETE_TOKEN"
+  fi
   if [ -z "${DEVICE_ID:-}" ]; then
     DEVICE_ID=$(random_hex 8)
-    save_config "$SERVER_URL" "$ACCOUNT_ID" "$ACCOUNT_KEY" "$DEVICE_ID" "${SERVER_TOKEN:-}"
+    save_config "$SERVER_URL" "$ACCOUNT_ID" "$ACCOUNT_KEY" "$DEVICE_ID" "${SERVER_TOKEN:-}" "$DELETE_TOKEN"
   fi
 }
 
@@ -90,6 +97,7 @@ save_config() {
   account_key=$3
   device_id=${4:-$(random_hex 8)}
   server_token=${5:-}
+  delete_token=${6:-}
   ensure_home
   {
     printf 'SERVER_URL=%s\n' "$(quote_value "$server")"
@@ -97,6 +105,7 @@ save_config() {
     printf 'ACCOUNT_ID=%s\n' "$(quote_value "$account_id")"
     printf 'ACCOUNT_KEY=%s\n' "$(quote_value "$account_key")"
     printf 'DEVICE_ID=%s\n' "$(quote_value "$device_id")"
+    [ -z "$delete_token" ] || printf 'DELETE_TOKEN=%s\n' "$(quote_value "$delete_token")"
   } >"$CONFIG"
   chmod 600 "$CONFIG"
 }
@@ -268,6 +277,16 @@ http_get() {
   fi
 }
 
+http_delete() {
+  path=$1
+  file=$2
+  if [ -n "${SERVER_TOKEN:-}" ]; then
+    curl -fsS -H "x-inter-env-token: $SERVER_TOKEN" -X DELETE --data-binary "@$file" "$(api_url "$path")" >/dev/null
+  else
+    curl -fsS -X DELETE --data-binary "@$file" "$(api_url "$path")" >/dev/null
+  fi
+}
+
 parse_server_spec() {
   spec=$1
   parsed_server=$(printf '%s' "$spec" | sed 's#/$##')
@@ -278,6 +297,16 @@ parse_server_spec() {
       parsed_server=${parsed_server%/*}
       ;;
   esac
+}
+
+register_account() {
+  verifier="$INTER_ENV_HOME/delete-verifier.$$"
+  sha256 "$DELETE_TOKEN" >"$verifier"
+  if ! http_put "/v1/accounts/$ACCOUNT_ID" "$verifier"; then
+    rm -f "$verifier"
+    return 1
+  fi
+  rm -f "$verifier"
 }
 
 ack_revision() {
@@ -294,7 +323,16 @@ setup_fresh() {
   account_key=$(random_b64 32)
   account_id=$(sha256 "$account_key" | cut -c 1-24)
   device_id=$(random_hex 8)
-  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token"
+  delete_token=$(random_b64 32)
+  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token" "$delete_token"
+  SERVER_URL=$parsed_server
+  SERVER_TOKEN=$parsed_token
+  ACCOUNT_ID=$account_id
+  DELETE_TOKEN=$delete_token
+  if ! register_account; then
+    rm -f "$CONFIG"
+    die "could not register account with the server"
+  fi
   printf 'Fresh inter-env account created.\n'
   printf 'Account id: %s\n' "$account_id"
   printf 'Recovery key: %s\n' "$account_key"
@@ -324,10 +362,12 @@ setup_link() {
   fi
   account_id=$(sed -n '1p' "$plain")
   account_key=$(sed -n '2p' "$plain")
+  delete_token=$(sed -n '3p' "$plain")
   rm -f "$enc" "$plain"
   [ -n "$account_id" ] && [ -n "$account_key" ] || die "invalid pairing bundle"
+  [ -n "$delete_token" ] || delete_token=$(sha256 "inter-env-delete:$account_key")
   device_id=$(random_hex 8)
-  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token"
+  save_config "$parsed_server" "$account_id" "$account_key" "$device_id" "$parsed_token" "$delete_token"
   printf 'Device linked to account %s\n' "$account_id"
 }
 
@@ -354,6 +394,7 @@ cmd_pair() {
   ensure_deps
   ensure_home
   load_config
+  register_account
   pair_id=$(random_hex 4)
   pair_secret=$(random_hex 16)
   code="$pair_id-$pair_secret"
@@ -362,13 +403,14 @@ cmd_pair() {
   {
     printf '%s\n' "$ACCOUNT_ID"
     printf '%s\n' "$ACCOUNT_KEY"
+    printf '%s\n' "$DELETE_TOKEN"
   } >"$plain"
   chmod 600 "$plain"
   encrypt_file "$plain" "$enc" "$pair_secret"
   http_put "/v1/pair/$pair_id" "$enc"
   rm -f "$plain" "$enc"
   printf 'Pairing code: %s\n' "$code"
-  printf 'Use it on the new device with: interenv init\n'
+  printf 'Use it on the new device with: interenv setup\n'
   printf 'The code is one-time and expires on the server.\n'
 }
 
@@ -491,29 +533,35 @@ install_hooks() {
   done
 }
 
-cmd_init() {
+cmd_setup() {
   ensure_deps
+  [ ! -f "$CONFIG" ] || die "this machine is already configured"
   mode=""
   server="${INTER_ENV_SERVER_URL:-$DEFAULT_SERVER_URL}"
   code=""
-  repo_arg="."
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --fresh) mode=fresh ;;
       --link) mode=link ;;
       --server) shift; server=${1:-} ;;
       --code) shift; code=${1:-} ;;
-      *) repo_arg=$1 ;;
+      *) die "unknown setup option: $1" ;;
     esac
     shift || true
   done
-  if [ ! -f "$CONFIG" ]; then
-    case "$mode" in
-      fresh) [ -n "$server" ] || die "--server is required"; setup_fresh "$server" ;;
-      link) [ -n "$server" ] || die "--server is required"; [ -n "$code" ] || die "--code is required"; setup_link "$server" "$code" ;;
-      *) interactive_account_setup ;;
-    esac
-  fi
+  case "$mode" in
+    fresh) [ -n "$server" ] || die "--server is required"; setup_fresh "$server" ;;
+    link) [ -n "$server" ] || die "--server is required"; [ -n "$code" ] || die "--code is required"; setup_link "$server" "$code" ;;
+    *) interactive_account_setup ;;
+  esac
+  printf 'Machine configured. Run "interenv init" inside each repo you want to sync.\n'
+}
+
+cmd_init() {
+  ensure_deps
+  [ "$#" -le 1 ] || die "usage: interenv init [repo]"
+  repo_arg=${1:-.}
+  load_config
   repo=$(repo_root "$repo_arg") || die "not inside a Git repo"
   remote=$(remote_url "$repo") || die "repo has no origin remote"
   project=$(project_id "$remote")
@@ -594,14 +642,67 @@ cmd_list() {
   awk -F '\t' '{printf "%s  %s  %s\n", $2, $1, $3}' "$REGISTRY"
 }
 
-cmd_install() {
+cmd_account_delete() {
+  ensure_deps
+  ensure_home
+  load_config
+  confirmed=0
+  [ "${1:-}" = "--yes" ] && confirmed=1
+  if [ "$confirmed" -ne 1 ]; then
+    printf 'This permanently deletes account %s and all synced server data.\n' "$ACCOUNT_ID"
+    printf 'Type the account id to confirm: '
+    IFS= read -r confirmation
+    [ "$confirmation" = "$ACCOUNT_ID" ] || die "account deletion cancelled"
+  fi
+
+  register_account >/dev/null 2>&1 || true
+  secret="$INTER_ENV_HOME/delete-secret.$$"
+  printf '%s' "$DELETE_TOKEN" >"$secret"
+  chmod 600 "$secret"
+  if ! http_delete "/v1/accounts/$ACCOUNT_ID" "$secret"; then
+    rm -f "$secret"
+    die "account deletion failed"
+  fi
+  rm -f "$secret"
+
+  if [ -f "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE")
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$CONFIG" "$REGISTRY" "$PID_FILE" "$LOG_FILE"
+  rm -rf "$STATE_DIR" "$LOCK_DIR"
+  rmdir "$INTER_ENV_HOME" 2>/dev/null || true
+  printf 'Account deleted from the server and this machine.\n'
+}
+
+cmd_upgrade() {
+  need curl
   url="${INTER_ENV_INSTALL_URL:-https://interenv.bytode.dev/install.sh}"
   curl -fsSL "$url" | sh
 }
 
+cmd_uninstall() {
+  target=$(command -v interenv 2>/dev/null || true)
+  [ -n "$target" ] && [ -f "$target" ] || die "could not find the installed interenv executable"
+  if [ ! -w "$target" ]; then
+    die "cannot remove $target; run: sudo interenv uninstall"
+  fi
+  rm -f "$target"
+  printf 'Removed %s\n' "$target"
+  printf 'Account data was kept. Run "interenv account delete" before uninstalling to remove it.\n'
+}
+
 case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
   init) shift; cmd_init "$@" ;;
   pair) shift; cmd_pair ;;
+  account)
+    shift
+    case "${1:-}" in
+      delete) shift; cmd_account_delete "$@" ;;
+      *) die "usage: interenv account delete" ;;
+    esac
+    ;;
   sync)
     shift
     ensure_deps
@@ -619,7 +720,8 @@ case "${1:-}" in
   stop) shift; cmd_stop ;;
   status) shift; cmd_status ;;
   list) shift; cmd_list ;;
-  install) shift; cmd_install ;;
+  upgrade) shift; cmd_upgrade ;;
+  uninstall) shift; cmd_uninstall ;;
   version|--version|-v) printf '%s\n' "$VERSION" ;;
   help|--help|-h|'') usage ;;
   *) usage >&2; exit 2 ;;

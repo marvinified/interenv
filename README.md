@@ -2,7 +2,7 @@
 
 `inter-env` syncs `.env` and `.env.*` files across machines for the same Git project.
 
-The CLI command is `interenv`. By default it uses the hosted free service at `https://interenv.bytode.dev`, so most users only install the CLI and run `interenv init` inside a repo.
+The CLI command is `interenv`. By default it uses the hosted free service at `https://interenv.bytode.dev`. Run `interenv setup` once per machine, then run `interenv init` inside each repo you want to sync.
 
 Each user has one inter-env account key. Env files are encrypted on the device before upload, and the backend stores only encrypted files.
 
@@ -11,14 +11,10 @@ Each user has one inter-env account key. Env files are encrypted on the device b
 Install the client:
 
 ```sh
-curl -fsSL https://interenv.bytode.dev/install.sh | sh
-```
-
-If `/usr/local/bin` needs permissions:
-
-```sh
 curl -fsSL https://interenv.bytode.dev/install.sh | sudo sh
 ```
+
+
 
 ## Requirements
 
@@ -36,49 +32,27 @@ Self-hosting the backend needs Node.js. The server is TypeScript and uses Expres
 
 ## Quick Start
 
-### New Account
-
-Inside a Git repo:
+### First Machine
 
 ```sh
-interenv init
+interenv setup    # choose "Set up fresh account"
+interenv init     # run inside each repo to sync
 ```
 
-Choose:
+Keep the recovery key printed during setup private.
 
-```text
-1) Set up fresh account
-```
-
-The command creates an account id, private account key, device id, local config at `~/.inter-env/config`, a project id from the repo's Git `origin`, and a background watcher.
-
-It also prints a recovery key. Keep it private. Anyone with that key can decrypt your synced env files.
-
-### Pair Another Device
-
-On an already linked device:
+### Another Machine
 
 ```sh
-interenv pair
+# On an existing machine
+interenv pair # returns a pairing code
+
+# On the new machine
+interenv setup    # choose "Link this device" and enter the pairing code
+interenv init     # run inside each repo to sync
 ```
 
-That prints a one-time pairing code.
 
-On the new device, inside the same Git project:
-
-```sh
-interenv init
-```
-
-Choose:
-
-```text
-2) Link this device with a pairing code
-```
-
-Paste the pairing code. The new device downloads an encrypted key bundle, decrypts it locally using the pairing code, saves the account key, then pulls the project env files.
-
-The server never receives the account key in plaintext. Pairing codes are one-time and expire after 15 minutes by default.
 
 ## How It Works
 
@@ -116,13 +90,13 @@ Other linked machines periodically pull the encrypted blob, decrypt it locally, 
 To point the CLI at a private or self-hosted backend, pass a URL with a token:
 
 ```sh
-INTER_ENV_SERVER_URL="https://private.example.com/my-token" interenv init
+INTER_ENV_SERVER_URL="https://private.example.com/my-token" interenv setup
 ```
 
 or:
 
 ```sh
-interenv init --fresh --server "https://private.example.com/my-token"
+interenv setup --fresh --server "https://private.example.com/my-token"
 ```
 
 The client stores `https://private.example.com` as the server URL and sends `my-token` as an auth header on every request.
@@ -187,11 +161,31 @@ interenv push
 
 Then run `interenv pull` or `interenv sync` on the new device.
 
+## Account Deletion
+
+To permanently delete the account, all of its server data, and local inter-env state:
+
+```sh
+interenv account delete
+```
+
+Deletion requires the account id as confirmation and a separate deletion secret shared between paired devices. The deletion secret cannot decrypt env files. The server keeps only a zero-byte revocation marker so another paired machine cannot recreate the deleted account.
+
+To remove only the CLI and keep the account:
+
+```sh
+interenv uninstall
+```
+
 ## Commands
 
 ```sh
-interenv init [repo]                         Set up account/link device, register repo, sync
+interenv setup                               Create an account or link this machine
+interenv setup --fresh --server URL[/token]  Create an account non-interactively
+interenv setup --link --server URL[/token] --code CODE
+interenv init [repo]                         Register and sync a Git repo
 interenv pair                                Create a one-time pairing code
+interenv account delete                      Delete the account and local state
 interenv sync [repo]                         Pull then push changed env files
 interenv pull [repo]                         Pull env files from the server
 interenv push [repo]                         Upload local env files
@@ -200,14 +194,19 @@ interenv start                               Start the watcher in the background
 interenv stop                                Stop the watcher
 interenv status                              Show account, watcher, and repo status
 interenv list                                List registered repos
+interenv upgrade                             Upgrade the CLI
+interenv uninstall                           Remove the CLI only
 interenv version                             Print the version
 ```
+
+
 
 ## Security Model
 
 - Env files are encrypted before upload.
 - The backend stores encrypted blobs only while a known device still needs to pull them.
 - The account key stays in `~/.inter-env/config` on linked devices.
+- Account deletion uses a separate secret that cannot decrypt env files.
 - Pairing transfers the account key through a one-time encrypted bundle.
 - The backend has no database.
 - If someone gets your account key or recovery key, they can decrypt your env files.

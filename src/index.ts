@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   createReadStream,
   existsSync,
@@ -32,7 +32,8 @@ app.get("/", (_req, res) => {
       "",
       "Encrypted .env sync across machines.",
       "",
-      "CLI: interenv init",
+      "Setup: interenv setup",
+      "Sync a repo: interenv init",
       "Install: curl -fsSL https://interenv.bytode.dev/install.sh | sh",
       "Health: /health",
       "API: /v1",
@@ -66,6 +67,72 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => {
   res.type("text/plain").send("ok\n");
+});
+
+app.put("/v1/accounts/:account", (req, res) => {
+  const { account } = req.params;
+  if (!validIds(res, account)) return;
+  if (existsSync(accountRevokedFile(account))) {
+    res.status(410).type("text/plain").send("account deleted\n");
+    return;
+  }
+
+  const verifier = requestBody(req).toString("utf8").trim();
+  if (!/^[a-f0-9]{64}$/.test(verifier)) {
+    res.status(400).type("text/plain").send("invalid deletion verifier\n");
+    return;
+  }
+
+  const file = accountDeleteVerifierFile(account);
+  if (existsSync(file)) {
+    const existing = readFileSync(file, "utf8").trim();
+    if (!sameSecret(existing, verifier)) {
+      res.status(409).type("text/plain").send("account already registered\n");
+      return;
+    }
+  } else {
+    writeFileAtomic(file, Buffer.from(`${verifier}\n`));
+  }
+
+  res.status(204).send();
+});
+
+app.delete("/v1/accounts/:account", (req, res) => {
+  const { account } = req.params;
+  if (!validIds(res, account)) return;
+
+  if (existsSync(accountRevokedFile(account))) {
+    res.status(204).send();
+    return;
+  }
+
+  const verifierFile = accountDeleteVerifierFile(account);
+  const deletionSecret = requestBody(req).toString("utf8").trim();
+  if (!existsSync(verifierFile) || !deletionSecret) {
+    res.status(401).type("text/plain").send("invalid deletion secret\n");
+    return;
+  }
+
+  const expected = readFileSync(verifierFile, "utf8").trim();
+  const supplied = sha256(Buffer.from(deletionSecret));
+  if (!sameSecret(expected, supplied)) {
+    res.status(401).type("text/plain").send("invalid deletion secret\n");
+    return;
+  }
+
+  writeFileAtomic(accountRevokedFile(account), Buffer.alloc(0));
+  rmSync(accountDir(account), { recursive: true, force: true });
+  res.status(204).send();
+});
+
+app.use("/v1/accounts/:account/projects", (req, res, next) => {
+  const { account } = req.params;
+  if (!validIds(res, account)) return;
+  if (existsSync(accountRevokedFile(account))) {
+    res.status(410).type("text/plain").send("account deleted\n");
+    return;
+  }
+  next();
 });
 
 app.put("/v1/accounts/:account/projects/:project/env", (req, res) => {
@@ -164,7 +231,19 @@ function writeFileAtomic(file: string, body: Buffer): void {
 }
 
 function projectDir(account: string, project: string): string {
-  return join(DATA_DIR, "accounts", account, "projects", project);
+  return join(accountDir(account), "projects", project);
+}
+
+function accountDir(account: string): string {
+  return join(DATA_DIR, "accounts", account);
+}
+
+function accountDeleteVerifierFile(account: string): string {
+  return join(accountDir(account), "delete.sha256");
+}
+
+function accountRevokedFile(account: string): string {
+  return join(DATA_DIR, "revoked", account);
 }
 
 function projectFile(account: string, project: string): string {
@@ -185,6 +264,12 @@ function pairFile(pairId: string): string {
 
 function sha256(buffer: Buffer): string {
   return createHash("sha256").update(buffer).digest("hex");
+}
+
+function sameSecret(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function cleanPairFiles(): void {

@@ -73,12 +73,14 @@ printf 'ONE=1\n' >"$TMP/device-a-repo/.env.local"
 printf 'API_ONE=1\n' >"$TMP/device-a-repo/apps/api/.env"
 printf 'WEB_ONE=1\n' >"$TMP/device-a-repo/packages/web/.env.local"
 
-INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init --fresh --server "$SERVER_URL" "$TMP/device-a-repo" >/dev/null
+INTER_ENV_HOME="$TMP/device-a-home" interenv setup --fresh --server "$SERVER_URL" >/dev/null
+INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-a-repo" >/dev/null
 
 code=$(INTER_ENV_HOME="$TMP/device-a-home" interenv pair | awk '/Pairing code:/ {print $3}')
 [ -n "$code" ] || fail "pairing code was not generated"
 
-INTER_ENV_HOME="$TMP/device-b-home" INTER_ENV_NO_START=1 interenv init --link --server "$SERVER_URL" --code "$code" "$TMP/device-b-repo" >/dev/null
+INTER_ENV_HOME="$TMP/device-b-home" interenv setup --link --server "$SERVER_URL" --code "$code" >/dev/null
+INTER_ENV_HOME="$TMP/device-b-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-b-repo" >/dev/null
 assert_file_contains "$TMP/device-b-repo/.env.local" "ONE=1"
 assert_file_contains "$TMP/device-b-repo/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/device-b-repo/packages/web/.env.local" "WEB_ONE=1"
@@ -109,5 +111,27 @@ fi
 if find "$TMP/server-data" -type f -name 'env.bin' -exec grep -q 'TWO=2' {} \; -print | grep -q .; then
   fail "server stored plaintext env contents"
 fi
+
+account_id=$(sed -n "s/^ACCOUNT_ID='\([^']*\)'$/\1/p" "$TMP/device-b-home/config")
+[ -n "$account_id" ] || fail "account id missing from device config"
+printf 'wrong-secret' >"$TMP/wrong-delete-secret"
+if curl -fsS -H "x-inter-env-token: testtoken" -X DELETE --data-binary "@$TMP/wrong-delete-secret" "http://127.0.0.1:$PORT/v1/accounts/$account_id" >/dev/null 2>&1; then
+  fail "server accepted an invalid account deletion secret"
+fi
+
+INTER_ENV_HOME="$TMP/device-b-home" interenv account delete --yes >/dev/null
+[ ! -d "$TMP/server-data/accounts/$account_id" ] || fail "server kept account data after account deletion"
+[ ! -f "$TMP/device-b-home/config" ] || fail "client kept local config after account deletion"
+printf 'AFTER_DELETE=1\n' >"$TMP/device-a-repo/.env.local"
+if INTER_ENV_HOME="$TMP/device-a-home" interenv push "$TMP/device-a-repo" >/dev/null 2>&1; then
+  fail "deleted account accepted an upload from another paired device"
+fi
+[ ! -d "$TMP/server-data/accounts/$account_id" ] || fail "paired device recreated a deleted account"
+
+mkdir -p "$TMP/uninstall-bin"
+cp "$ROOT/bin/interenv" "$TMP/uninstall-bin/interenv"
+chmod +x "$TMP/uninstall-bin/interenv"
+PATH="$TMP/uninstall-bin:$PATH" interenv uninstall >/dev/null
+[ ! -e "$TMP/uninstall-bin/interenv" ] || fail "uninstall kept the CLI executable"
 
 printf 'PASS\n'
