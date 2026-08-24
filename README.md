@@ -89,7 +89,7 @@ git@github.com:owner/app.git
 https://github.com/owner/app.git
 ```
 
-It syncs only root-level env files:
+It syncs env files in the repo root and subdirectories:
 
 ```text
 .env
@@ -103,7 +103,11 @@ Examples:
 .env.local
 .env.production
 .env.development
+apps/api/.env
+packages/web/.env.local
 ```
+
+It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`.
 
 When a watched env file changes, the client packages the env files with `tar`, encrypts the package with the local account key using `openssl`, and uploads the encrypted blob to the backend.
 

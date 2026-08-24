@@ -182,14 +182,27 @@ repo_state_file() {
 
 env_files() {
   repo=$1
-  for file in "$repo"/.env "$repo"/.env.*; do
-    [ -f "$file" ] || continue
-    base=${file##*/}
-    case "$base" in
-      .inter-env* | .env.*.tmp) continue ;;
-    esac
-    printf '%s\n' "$base"
-  done
+  (
+    cd "$repo" || exit 1
+    find . \
+      \( -path './.git' \
+      -o -path './node_modules' \
+      -o -path './vendor' \
+      -o -path './dist' \
+      -o -path './build' \
+      -o -path './.next' \
+      -o -path './.turbo' \
+      -o -path './.cache' \
+      -o -path './coverage' \) -prune \
+      -o -type f \( -name '.env' -o -name '.env.*' \) -print
+  ) | sed 's#^\./##' | awk -F '/' '
+    {
+      base = $NF
+      if (base ~ /^\.inter-env/) next
+      if (base ~ /^\.env\..*\.tmp$/) next
+      print
+    }
+  '
 }
 
 env_signature() {
