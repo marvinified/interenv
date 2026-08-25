@@ -8,10 +8,14 @@ TMP="${TMPDIR:-/tmp}/inter-env-test.$$"
 PORT=$((18080 + ($$ % 1000)))
 SERVER_URL="http://127.0.0.1:$PORT/testtoken"
 SERVER_PID=""
+WATCHER_PID=""
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$WATCHER_PID" ]; then
+    kill "$WATCHER_PID" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP"
 }
@@ -39,6 +43,10 @@ assert_file_lacks() {
 }
 
 mkdir -p "$TMP"
+HOME="$TMP/user-home"
+export HOME
+mkdir -p "$HOME"
+[ "$(interenv version)" = "0.8.0" ] || fail "unexpected CLI version"
 SERVER_ENTRY="$ROOT/dist/index.js"
 [ -f "$SERVER_ENTRY" ] || fail "missing compiled server; run yarn build"
 
@@ -188,6 +196,19 @@ fi
 INTER_ENV_HOME="$TMP/device-a-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-a-new-repo" >/dev/null
 new_project_id=$(awk -F '\t' 'NR == 1 {print $2}' "$TMP/device-a-home/repos.tsv")
 [ -d "$TMP/server-data/accounts/$account_id/projects/$new_project_id" ] || fail "deleted project did not free a project slot"
+
+cp -R "$TMP/device-a-home" "$TMP/failure-home"
+awk '{ if ($0 ~ /^SERVER_URL=/) print "SERVER_URL=\047http://127.0.0.1:1\047"; else print }' "$TMP/failure-home/config" >"$TMP/failure-home/config.tmp"
+mv "$TMP/failure-home/config.tmp" "$TMP/failure-home/config"
+rm -f "$TMP/failure-home/inter-env.pid"
+INTER_ENV_HOME="$TMP/failure-home" INTER_ENV_INTERVAL=1 interenv watch >/dev/null 2>&1 &
+WATCHER_PID=$!
+sleep 2
+kill -0 "$WATCHER_PID" 2>/dev/null || fail "watcher exited after a transient server failure"
+grep -q 'retrying in 1s' "$TMP/failure-home/inter-env.log" || fail "watcher did not log retry behavior"
+kill "$WATCHER_PID" >/dev/null 2>&1 || true
+wait "$WATCHER_PID" 2>/dev/null || true
+WATCHER_PID=""
 
 account_id=$(sed -n "s/^ACCOUNT_ID='\([^']*\)'$/\1/p" "$TMP/device-b-home/config")
 [ -n "$account_id" ] || fail "account id missing from device config"

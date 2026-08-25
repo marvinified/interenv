@@ -2,7 +2,7 @@
 
 set -eu
 
-VERSION="0.6.0"
+VERSION="0.8.0"
 DEFAULT_SERVER_URL="${INTER_ENV_DEFAULT_SERVER_URL:-https://interenv.bytode.dev}"
 INTER_ENV_HOME="${INTER_ENV_HOME:-$HOME/.inter-env}"
 CONFIG="$INTER_ENV_HOME/config"
@@ -11,6 +11,8 @@ STATE_DIR="$INTER_ENV_HOME/state"
 LOCK_DIR="$INTER_ENV_HOME/lock"
 LOG_FILE="$INTER_ENV_HOME/inter-env.log"
 PID_FILE="$INTER_ENV_HOME/inter-env.pid"
+LAUNCH_AGENT="$HOME/Library/LaunchAgents/dev.bytode.interenv.plist"
+SYSTEMD_SERVICE="$HOME/.config/systemd/user/interenv.service"
 INTERVAL="${INTER_ENV_INTERVAL:-5}"
 PAIR_KDF_ITERATIONS=200000
 
@@ -1003,14 +1005,33 @@ cmd_share() {
 sync_all() {
   all_repos | while IFS= read -r repo; do
     [ -d "$repo/.git" ] || continue
-    cmd_sync_repo "$repo" || log "sync failed for $repo"
+    if (cmd_sync_repo "$repo") >>"$LOG_FILE" 2>&1; then
+      :
+    else
+      log "sync failed for $repo; retrying in ${INTERVAL}s"
+    fi
   done
+}
+
+cleanup_watcher_pid() {
+  if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$PID_FILE"
+  fi
+}
+
+stop_watcher_on_signal() {
+  cleanup_watcher_pid
+  trap - EXIT INT TERM
+  exit 0
 }
 
 cmd_watch() {
   ensure_deps
   ensure_home
   load_config
+  printf '%s\n' "$$" >"$PID_FILE"
+  trap cleanup_watcher_pid EXIT
+  trap stop_watcher_on_signal INT TERM
   log "watcher started"
   while :; do
     sync_all
@@ -1018,30 +1039,133 @@ cmd_watch() {
   done
 }
 
-cmd_start() {
-  ensure_home
+watcher_executable() {
+  executable=$(command -v interenv 2>/dev/null || printf '%s' "$0")
+  case "$executable" in
+    /*) ;;
+    *) executable=$(CDPATH= cd -- "$(dirname "$executable")" && pwd)/$(basename "$executable") ;;
+  esac
+  printf '%s\n' "$executable"
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+start_launch_agent() {
+  executable=$(xml_escape "$(watcher_executable)")
+  state_home=$(xml_escape "$INTER_ENV_HOME")
+  log_path=$(xml_escape "$LOG_FILE")
+  mkdir -p "$(dirname "$LAUNCH_AGENT")"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0"><dict>'
+    printf '%s\n' '<key>Label</key><string>dev.bytode.interenv</string>'
+    printf '%s\n' '<key>ProgramArguments</key><array>'
+    printf '<string>%s</string><string>watch</string>\n' "$executable"
+    printf '%s\n' '</array>'
+    printf '%s\n' '<key>EnvironmentVariables</key><dict>'
+    printf '<key>INTER_ENV_HOME</key><string>%s</string>\n' "$state_home"
+    printf '%s\n' '</dict>'
+    printf '%s\n' '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>'
+    printf '<key>StandardOutPath</key><string>%s</string>\n' "$log_path"
+    printf '<key>StandardErrorPath</key><string>%s</string>\n' "$log_path"
+    printf '%s\n' '</dict></plist>'
+  } >"$LAUNCH_AGENT"
+  uid=$(id -u)
+  launchctl enable "gui/$uid/dev.bytode.interenv" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "gui/$uid" "$LAUNCH_AGENT" >/dev/null 2>&1; then
+    launchctl load -w "$LAUNCH_AGENT" >/dev/null 2>&1
+  fi
+}
+
+systemd_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+}
+
+start_systemd_service() {
+  executable=$(systemd_escape "$(watcher_executable)")
+  state_home=$(systemd_escape "$INTER_ENV_HOME")
+  mkdir -p "$(dirname "$SYSTEMD_SERVICE")"
+  {
+    printf '%s\n' '[Unit]'
+    printf '%s\n' 'Description=inter-env watcher'
+    printf '%s\n' 'After=network-online.target'
+    printf '%s\n' 'Wants=network-online.target'
+    printf '%s\n' '[Service]'
+    printf 'ExecStart="%s" watch\n' "$executable"
+    printf 'Environment="INTER_ENV_HOME=%s"\n' "$state_home"
+    printf '%s\n' 'Restart=always'
+    printf '%s\n' 'RestartSec=5'
+    printf '%s\n' '[Install]'
+    printf '%s\n' 'WantedBy=default.target'
+  } >"$SYSTEMD_SERVICE"
+  systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+  systemctl --user enable --now interenv.service >/dev/null 2>&1
+}
+
+remove_managed_service() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      if [ -f "$LAUNCH_AGENT" ]; then
+        uid=$(id -u)
+        launchctl bootout "gui/$uid/dev.bytode.interenv" >/dev/null 2>&1 || launchctl unload -w "$LAUNCH_AGENT" >/dev/null 2>&1 || true
+        rm -f "$LAUNCH_AGENT"
+      fi
+      ;;
+    Linux)
+      if [ -f "$SYSTEMD_SERVICE" ]; then
+        systemctl --user disable --now interenv.service >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_SERVICE"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
+}
+
+stop_watcher_process() {
   if [ -f "$PID_FILE" ]; then
     pid=$(cat "$PID_FILE")
     if kill -0 "$pid" 2>/dev/null; then
-      printf 'interenv watcher already running: %s\n' "$pid"
-      return 0
+      process_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      case "$process_command" in
+        *interenv*watch*) kill "$pid" >/dev/null 2>&1 || true ;;
+      esac
     fi
+    rm -f "$PID_FILE"
   fi
+}
+
+cmd_start() {
+  ensure_home
+  ensure_deps
+  load_config
+  remove_managed_service
+  stop_watcher_process
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      start_launch_agent || die "could not install the macOS watcher service"
+      printf 'interenv watcher service started with launchd\n'
+      return 0
+      ;;
+    Linux)
+      if command -v systemctl >/dev/null 2>&1 && start_systemd_service; then
+        printf 'interenv watcher service started with systemd\n'
+        return 0
+      fi
+      remove_managed_service
+      ;;
+  esac
   nohup "$0" watch >>"$LOG_FILE" 2>&1 &
   printf '%s\n' "$!" >"$PID_FILE"
-  printf 'interenv watcher started: %s\n' "$!"
+  printf 'interenv watcher started without reboot persistence: %s\n' "$!"
 }
 
 cmd_stop() {
-  [ -f "$PID_FILE" ] || die "watcher is not running"
-  pid=$(cat "$PID_FILE")
-  if kill "$pid" 2>/dev/null; then
-    rm -f "$PID_FILE"
-    printf 'interenv watcher stopped\n'
-  else
-    rm -f "$PID_FILE"
-    die "stale pid file removed"
-  fi
+  remove_managed_service
+  stop_watcher_process
+  printf 'interenv watcher stopped and automatic startup disabled\n'
 }
 
 cmd_status() {
@@ -1102,10 +1226,8 @@ cmd_account_delete() {
   fi
   rm -f "$secret"
 
-  if [ -f "$PID_FILE" ]; then
-    pid=$(cat "$PID_FILE")
-    kill "$pid" >/dev/null 2>&1 || true
-  fi
+  remove_managed_service
+  stop_watcher_process
   rm -f "$CONFIG" "$REGISTRY" "$PID_FILE" "$LOG_FILE"
   rm -rf "$STATE_DIR" "$LOCK_DIR"
   rmdir "$INTER_ENV_HOME" 2>/dev/null || true
@@ -1116,6 +1238,7 @@ cmd_upgrade() {
   need curl
   url="${INTER_ENV_INSTALL_URL:-https://interenv.bytode.dev/install.sh}"
   curl -fsSL "$url" | sh
+  [ ! -f "$CONFIG" ] || cmd_start >/dev/null
 }
 
 cmd_uninstall() {
@@ -1124,6 +1247,8 @@ cmd_uninstall() {
   if [ ! -w "$target" ]; then
     die "cannot remove $target; run: sudo interenv uninstall"
   fi
+  remove_managed_service
+  stop_watcher_process
   rm -f "$target"
   printf 'Removed %s\n' "$target"
   printf 'Account data was kept. Run "interenv account delete" before uninstalling to remove it.\n'

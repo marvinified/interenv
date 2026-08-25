@@ -138,6 +138,12 @@ On a repo's first `interenv init`, the client pulls an existing remote copy befo
 
 Pairing codes use six uppercase, ambiguity-free characters. They are one-time, expire after 15 minutes by default, and protect the temporary key bundle with a deliberately expensive key-derivation step. Active codes are reserved atomically; if a collision occurs, the client generates another code before displaying it.
 
+### Watcher
+
+`interenv init` starts a managed per-user watcher. On macOS it installs a LaunchAgent; on Linux it installs a systemd user service when available. The service resumes after sleep, restarts after crashes or temporary server failures, and starts again after reboot when the user session starts. Linux servers that must run before login may additionally require systemd lingering for that user.
+
+Watcher activity and retry errors are written to `~/.inter-env/inter-env.log`. `interenv stop` stops the watcher and disables automatic startup; `interenv start` installs and enables it again.
+
 ## Hosted Server
 
 By default it uses the hosted free service at `https://interenv.bytode.dev`.
