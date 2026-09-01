@@ -85,15 +85,19 @@ git -C "$TMP/device-a-repo" remote add origin git@github.com:example/app.git
 git -C "$TMP/device-b-repo" remote add origin https://github.com/example/app.git
 
 mkdir -p "$TMP/device-a-repo/apps/api" "$TMP/device-a-repo/apps/ignored" "$TMP/device-a-repo/packages/web"
-printf 'ONE=1\nLOCAL_ONLY=device-a\n' >"$TMP/device-a-repo/.env.local"
+printf 'ONE=1\nLOCAL_ONLY=device-a\nLOCAL_CERT="device-a-line-1\ndevice-a-line-2"\nSHARED_AFTER_CERT=1\n' >"$TMP/device-a-repo/.env.local"
 printf 'API_ONE=1\nAPI_LOCAL=device-a\n' >"$TMP/device-a-repo/apps/api/.env"
 printf 'WEB_ONE=1\n' >"$TMP/device-a-repo/packages/web/.env.local"
+printf 'EXAMPLE=1\n' >"$TMP/device-a-repo/.env.example"
+printf 'LOCAL_EXAMPLE=1\n' >"$TMP/device-a-repo/.env.local.example"
+printf 'EXAMPLES=1\n' >"$TMP/device-a-repo/.env.examples"
 printf 'PRIVATE=1\n' >"$TMP/device-a-repo/.env.private"
 printf 'IGNORED=1\n' >"$TMP/device-a-repo/apps/ignored/.env"
 printf '%s\n' \
   'file .env.private' \
   'file apps/ignored/.env*' \
   'variable LOCAL_ONLY' \
+  'variable LOCAL_CERT' \
   'variable apps/*/.env API_LOCAL' >"$TMP/device-a-repo/.envignore"
 cp "$TMP/device-a-repo/.envignore" "$TMP/device-b-repo/.envignore"
 
@@ -111,25 +115,37 @@ duplicate_status=$(curl -sS -o /dev/null -w '%{http_code}' -H "x-inter-env-token
 printf 'STALE=local\n' >"$TMP/device-b-repo/.env.local"
 INTER_ENV_HOME="$TMP/device-b-home" interenv setup --link --server "$SERVER_URL" --code "$code" >/dev/null
 INTER_ENV_HOME="$TMP/device-b-home" INTER_ENV_NO_START=1 interenv init "$TMP/device-b-repo" >/dev/null
-assert_file_contains "$TMP/device-b-repo/.env.local" "ONE=1"
+grep -q '^ONE=1$' "$TMP/device-b-repo/.env.local" || fail "initial pull did not sync the root env variable"
 assert_file_contains "$TMP/device-b-repo/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/device-b-repo/packages/web/.env.local" "WEB_ONE=1"
 assert_file_lacks "$TMP/device-b-repo/.env.local" "LOCAL_ONLY"
+assert_file_lacks "$TMP/device-b-repo/.env.local" "device-a-line-1"
+assert_file_lacks "$TMP/device-b-repo/.env.local" "device-a-line-2"
+grep -q '^SHARED_AFTER_CERT=1$' "$TMP/device-b-repo/.env.local" || fail "initial pull lost the variable after an ignored multiline value"
 assert_file_lacks "$TMP/device-b-repo/apps/api/.env" "API_LOCAL"
 [ ! -f "$TMP/device-b-repo/.env.private" ] || fail "ignored env file was synced"
 [ ! -f "$TMP/device-b-repo/apps/ignored/.env" ] || fail "ignored nested env file was synced"
+[ ! -f "$TMP/device-b-repo/.env.example" ] || fail ".env.example was synced"
+[ ! -f "$TMP/device-b-repo/.env.local.example" ] || fail ".env.local.example was synced"
+[ ! -f "$TMP/device-b-repo/.env.examples" ] || fail ".env.examples was synced"
 
 share_command=$(INTER_ENV_HOME="$TMP/device-a-home" interenv share "$TMP/device-a-repo")
 share_url=$(printf '%s\n' "$share_command" | awk '/^curl -fsSL / {print $3}')
 printf '%s\n' "$share_url" | grep -Eq "^http://127.0.0.1:$PORT/share.sh\?[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}$" || fail "share did not return a valid one-time command"
 mkdir -p "$TMP/share-target"
 curl -fsSL "$share_url" | sh -s -- "$TMP/share-target" >/dev/null
-assert_file_contains "$TMP/share-target/.env.local" "ONE=1"
+grep -q '^ONE=1$' "$TMP/share-target/.env.local" || fail "one-time share omitted the root env variable"
 assert_file_contains "$TMP/share-target/apps/api/.env" "API_ONE=1"
 assert_file_contains "$TMP/share-target/packages/web/.env.local" "WEB_ONE=1"
 assert_file_lacks "$TMP/share-target/.env.local" "LOCAL_ONLY"
+assert_file_lacks "$TMP/share-target/.env.local" "device-a-line-1"
+assert_file_lacks "$TMP/share-target/.env.local" "device-a-line-2"
+grep -q '^SHARED_AFTER_CERT=1$' "$TMP/share-target/.env.local" || fail "one-time share lost the variable after an ignored multiline value"
 assert_file_lacks "$TMP/share-target/apps/api/.env" "API_LOCAL"
 [ ! -f "$TMP/share-target/.env.private" ] || fail "one-time share included an ignored env file"
+[ ! -f "$TMP/share-target/.env.example" ] || fail "one-time share included .env.example"
+[ ! -f "$TMP/share-target/.env.local.example" ] || fail "one-time share included .env.local.example"
+[ ! -f "$TMP/share-target/.env.examples" ] || fail "one-time share included .env.examples"
 mkdir -p "$TMP/share-second-target"
 if curl -fsSL "$share_url" 2>/dev/null | sh -s -- "$TMP/share-second-target" >/dev/null 2>&1; then
   fail "one-time share could be downloaded twice"
@@ -139,7 +155,7 @@ if find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
   fail "server kept env blob after both devices acknowledged the first revision"
 fi
 
-printf 'TWO=2\nLOCAL_ONLY=device-b\n' >"$TMP/device-b-repo/.env.local"
+printf 'TWO=2\nLOCAL_ONLY=device-b\nLOCAL_CERT="device-b-line-1\ndevice-b-line-2"\nSHARED_AFTER_CERT=2\n' >"$TMP/device-b-repo/.env.local"
 printf 'API_TWO=2\nAPI_LOCAL=device-b\n' >"$TMP/device-b-repo/apps/api/.env"
 mkdir -p "$TMP/device-b-repo/services/worker"
 printf 'WORKER_TWO=2\n' >"$TMP/device-b-repo/services/worker/.env.production"
@@ -154,9 +170,18 @@ grep -q '^TWO=2$' "$TMP/device-a-repo/.env.local" || fail "pull did not update t
 grep -q '^API_TWO=2$' "$TMP/device-a-repo/apps/api/.env" || fail "pull did not update the nested env file"
 assert_file_contains "$TMP/device-a-repo/services/worker/.env.production" "WORKER_TWO=2"
 grep -q '^LOCAL_ONLY=device-a$' "$TMP/device-a-repo/.env.local" || fail "pull did not preserve an ignored local variable"
+grep -q '^LOCAL_CERT="device-a-line-1$' "$TMP/device-a-repo/.env.local" || fail "pull did not preserve the first line of an ignored multiline variable"
+grep -q '^device-a-line-2"$' "$TMP/device-a-repo/.env.local" || fail "pull did not preserve the continuation of an ignored multiline variable"
+assert_file_lacks "$TMP/device-a-repo/.env.local" "device-b-line-2"
+grep -q '^SHARED_AFTER_CERT=2$' "$TMP/device-a-repo/.env.local" || fail "pull lost the variable after an ignored multiline value"
 grep -q '^API_LOCAL=device-a$' "$TMP/device-a-repo/apps/api/.env" || fail "pull did not preserve a file-specific ignored variable"
+grep -q '^TWO=2$' "$TMP/device-a-repo/.env.local" || fail "sync did not keep the pulled root env variable"
+grep -q '^API_TWO=2$' "$TMP/device-a-repo/apps/api/.env" || fail "sync did not keep the pulled nested env variable"
 assert_file_contains "$TMP/device-a-repo/.env.private" "PRIVATE=1"
 assert_file_contains "$TMP/device-a-repo/apps/ignored/.env" "IGNORED=1"
+assert_file_contains "$TMP/device-a-repo/.env.example" "EXAMPLE=1"
+assert_file_contains "$TMP/device-a-repo/.env.local.example" "LOCAL_EXAMPLE=1"
+assert_file_contains "$TMP/device-a-repo/.env.examples" "EXAMPLES=1"
 
 if find "$TMP/server-data" -type f -name 'env.bin' -print | grep -q .; then
   fail "server kept env blob after both devices acknowledged the second revision"
@@ -174,7 +199,7 @@ printf '\n' >>"$TMP/device-a-repo/apps/api/.env"
 INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
 meta_after=$(curl -fsS -H "x-inter-env-token: testtoken" "$meta_url")
 [ "$meta_before" = "$meta_after" ] || fail "blank line changed the canonical env hash"
-printf 'TWO=2\nLOCAL_ONLY=changed-locally\n' >"$TMP/device-a-repo/.env.local"
+printf 'TWO=2\nLOCAL_ONLY=changed-locally\nLOCAL_CERT="changed-line-1\nchanged-line-2"\nSHARED_AFTER_CERT=2\n' >"$TMP/device-a-repo/.env.local"
 printf 'PRIVATE=changed-locally\n' >"$TMP/device-a-repo/.env.private"
 INTER_ENV_HOME="$TMP/device-a-home" interenv sync "$TMP/device-a-repo" >/dev/null
 meta_after_ignore_change=$(curl -fsS -H "x-inter-env-token: testtoken" "$meta_url")

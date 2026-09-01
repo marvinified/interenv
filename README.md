@@ -107,7 +107,7 @@ apps/api/.env
 packages/web/.env.local
 ```
 
-It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`.
+It skips common generated or dependency directories, including `.git`, `node_modules`, `vendor`, `dist`, `build`, `.next`, `.turbo`, `.cache`, and `coverage`. It also skips dotenv example files such as `.env.example`, `.env.examples`, and `.env.local.example`.
 
 ### Ignoring Env Data
 

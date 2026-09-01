@@ -243,6 +243,7 @@ env_files() {
       base = $NF
       if (base ~ /^\.inter-env/) next
       if (base ~ /^\.env\..*\.tmp$/) next
+      if (base ~ /^\.env(\..*)?\.examples?$/) next
       print
     }
   ' | while IFS= read -r name; do
@@ -314,11 +315,17 @@ filter_env_file() {
   fef_input=$3
   fef_output=$4
   : >"$fef_output"
+  fef_ignoring_block=0
   while IFS= read -r fef_line || [ -n "$fef_line" ]; do
     fef_key=$(env_line_key "$fef_line")
-    if [ -n "$fef_key" ] && ignored_env_variable "$fef_repo" "$fef_name" "$fef_key"; then
-      continue
+    if [ -n "$fef_key" ]; then
+      if ignored_env_variable "$fef_repo" "$fef_name" "$fef_key"; then
+        fef_ignoring_block=1
+      else
+        fef_ignoring_block=0
+      fi
     fi
+    [ "$fef_ignoring_block" -eq 0 ] || continue
     printf '%s\n' "$fef_line" >>"$fef_output"
   done <"$fef_input"
 }
@@ -330,9 +337,17 @@ collect_ignored_variables() {
   civ_output=$4
   : >"$civ_output"
   [ -f "$civ_input" ] || return 0
+  civ_collecting_block=0
   while IFS= read -r civ_line || [ -n "$civ_line" ]; do
     civ_key=$(env_line_key "$civ_line")
-    if [ -n "$civ_key" ] && ignored_env_variable "$civ_repo" "$civ_name" "$civ_key"; then
+    if [ -n "$civ_key" ]; then
+      if ignored_env_variable "$civ_repo" "$civ_name" "$civ_key"; then
+        civ_collecting_block=1
+      else
+        civ_collecting_block=0
+      fi
+    fi
+    if [ "$civ_collecting_block" -eq 1 ]; then
       printf '%s\n' "$civ_line" >>"$civ_output"
     fi
   done <"$civ_input"
